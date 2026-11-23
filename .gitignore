@@ -1,0 +1,22 @@
+# Runtime reports are sensitive and must never be committed.
+reports/
+
+# Local configuration, credentials and environment files.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Raw logs and temporary output.
+*.log
+*.tmp
+*.temp
+.DS_Store
+Thumbs.db
+
+# Local editor and Python scratch output.
+__pycache__/
+*.pyc
+.vscode/
+.idea/
