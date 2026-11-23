@@ -94,14 +94,22 @@ Owner detection is mandatory and read-only:
 | Detected owner | Allowed update path |
 |---|---|
 | Source build | `hermes update --set-channel stable --yes` |
-| Microsoft Store (`9PMXK8CZC7KR`) | `winget upgrade --id 9PMXK8CZC7KR --exact --source msstore ...` |
-| Signed sideload MSIX + verified descriptor | `Add-AppxPackage -AppInstallerFile ...` |
+| Microsoft Store (`NousResearchInc.HermesAgent`, product `9PMXK8CZC7KR`) | `winget upgrade --id 9PMXK8CZC7KR --exact --source msstore ...` |
+| Signed sideload MSIX (`NousResearch.HermesBundled`) + verified descriptor | `Add-AppxPackage -AppInstallerFile ...` |
 | Source + MSIX both present | `BLOCKED` |
-| Store vs sideload unclear | `BLOCKED` |
+| Store vs sideload unclear or unrecognized identity | `BLOCKED` |
 | Not installed | `BLOCKED`, no bootstrap |
 
+Store and sideload are different official identities. A Store identity that is
+not Store-signed, a sideload identity with a non-Nous publisher, an unrecognized
+Hermes package, or both official MSIX variants at once is blocked rather than
+guessed. A recognized sideload owner without a descriptor is `UNKNOWN` in check
+mode and cannot update.
+
 No GUI launch, no blanket process kill, no distribution conversion, no
-unrestricted `winget upgrade --all`, no token scraping.
+unrestricted `winget upgrade --all`, no token scraping. Source updates also
+require the resolved CLI install directory to match the discovered checkout,
+the official NousResearch Git remote, a clean tree, and the stable channel.
 
 ## Verdicts and exit codes
 
@@ -136,7 +144,8 @@ receipt follow-ups, `latest.json` selection, user-scope units, wrong checkout
 binding, blocked update (dirty/migration/sudo), successful update (one updater
 call, backend PID refresh), upstream restart respect, stale gateway refresh,
 partial receipt, updater failure with no retry, already-current, argument
-rejection, and redaction. Current result: **72 assertions passed**.
+rejection, provenance failures, unverified health states, and redaction.
+Current result: **93 assertions passed**.
 
 Windows (must run on a Windows host):
 
@@ -168,8 +177,8 @@ bash tests/run-tests.sh
   migration risk and blocks update rather than guessing.
 - Windows `check`/`update` have **not** been executed on Windows in this
   environment. The script parses successfully under PowerShell 7.7 on Linux,
-  is written for Windows PowerShell 5.1, but real Windows 11 acceptance is
-  pending.
+  and PSScriptAnalyzer reports no PowerShell 5.1 syntax-compatibility findings,
+  but real Windows 11 runtime acceptance is still **NOT_TESTED**.
 - Neither script has proven Windows authentication or an authenticated
   WebSocket. Those remain `NOT_TESTED` until exercised on Windows with approved
   credentials.
@@ -182,12 +191,14 @@ bash tests/run-tests.sh
 - A configured-but-unserved profile is reported, not repaired. The operator
   decides whether it is intentionally parked.
 - Sideload descriptor discovery is not standardized; without a verified
-  descriptor the result is `BLOCKED`.
+  descriptor check reports `UNKNOWN` and update is `BLOCKED`.
 - WinGet output/exit codes vary by distributor and version; the script records
   bounded raw evidence and does not force a fallback.
 - Linux diagnostics are run sequentially and are bounded per command. On a slow
   or busy host, optional diagnostics such as `hermes doctor` may be
-  `NOT_TESTED` rather than blocking the whole check.
+  `NOT_TESTED` rather than blocking the whole check. Missing essential evidence
+  (active backend without HTTP verification, no receipt, or incomplete profile
+  inventory) yields `UNKNOWN`, not `HEALTHY`.
 - No cross-host orchestration. Run each skill on its actual host and merge the
   two reports.
 

@@ -69,15 +69,32 @@ $script:Owner = 'Unknown'
 $script:OwnerEvidence = ''
 $script:HeremesCommand = $null
 $script:HeremesPath = ''
+$script:HeremesCliPresent = $false
 $script:SourceCheckout = ''
 $script:SourcePresent = $false
+$script:SourceInstallDirectory = ''
+$script:SourceInstallMethod = 'unknown'
+$script:SourceChannel = 'unknown'
+$script:SourceVersionOk = 'unknown'
+$script:UpdateCheckChannel = 'unknown'
+$script:SourceProvenanceOk = 'unknown'
+$script:GitRemote = 'unknown'
+$script:GitBranch = 'unknown'
+$script:GitDirty = 'unknown'
 $script:AppxPackage = $null
 $script:AppxCount = 0
+$script:AppxOwnerCandidate = 'None'
+$script:AppxIssue = ''
+$script:AppxIdentities = ''
 $script:InstalledVersion = 'unknown'
 $script:InstalledVersionAfter = 'not applicable'
 $script:PackageIdentity = 'not applicable'
 $script:PackagePublisher = 'not applicable'
 $script:SignatureKind = 'not applicable'
+$script:SideloadDescriptorValid = $false
+$script:SideloadDescriptorPath = ''
+$script:SideloadDescriptorReason = ''
+$script:SideloadDescriptorVersion = 'unknown'
 $script:UpdateAvailable = 'unknown'
 $script:AvailableVersion = 'unknown'
 $script:DistributorState = 'unknown'
@@ -128,29 +145,35 @@ $script:Evidence = New-Object System.Collections.Generic.List[string]
 $script:Journal = 'not collected'
 
 $script:StoreProductId = '9PMXK8CZC7KR'
-$script:AppxName = 'NousResearch.HermesBundled'
+# Official Store submission identity (apps/desktop/product-identity.cjs, storeMsix).
+$script:StoreAppxName = 'NousResearchInc.HermesAgent'
+$script:StorePublisher = 'CN=EE6D86E4-606F-4E38-B940-AD7248C9D519'
+# Official out-of-store/sideload identity (msixAppIdWithOrg / channel .appinstaller).
+$script:BundledAppxName = 'NousResearch.HermesBundled'
+$script:SideloadPublisherPattern = '^CN=Nous Research Inc\.'
 $script:MinFreeMb = 2048
 
 # ---------------------------------------------------------------------------
 # Output, sanitizing, rows
 # ---------------------------------------------------------------------------
 function Write-Say([string]$Message) {
-    Write-Output $Message
+    Write-Output (Sanitize-Text $Message)
 }
 
 function Write-WarnLine([string]$Message) {
-    [Console]::Error.WriteLine("WARN: $Message")
+    [Console]::Error.WriteLine("WARN: $(Sanitize-Text $Message)")
 }
 
 function Sanitize-Text {
     param([string]$Text)
     if ($null -eq $Text) { return '' }
     $s = $Text
-    $s = [regex]::Replace($s, '(https?://)[^/@\s]+@', '$1[REDACTED]@', 'IgnoreCase')
-    $s = [regex]::Replace($s, '([?&](access_token|token|api[_-]?key|apikey|key|secret|password|passwd|signature|sig|auth|code)=)[^&\s]+', '$1[REDACTED]', 'IgnoreCase')
+    $s = [regex]::Replace($s, '((https?|ssh|git)://)[^/@\s]+@', '$1[REDACTED]@', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
+    $s = [regex]::Replace($s, '([?&][^=\s]+=)[^&\s]+', '$1[REDACTED]')
     $s = [regex]::Replace($s, '(Authorization:\s*).*', '$1[REDACTED]', [Text.RegularExpressions.RegexOptions]::IgnoreCase)
     $s = [regex]::Replace($s, '(Bearer\s+)[A-Za-z0-9._~+/-]+=*', '$1[REDACTED]', 'IgnoreCase')
-    $s = [regex]::Replace($s, '((password|passwd|token|secret|api[_-]?key|auth[_-]?token)\s*[=:]\s*)[^\s"'']+', '$1[REDACTED]', 'IgnoreCase')
+    $s = [regex]::Replace($s, '((password|passwd|token|secret|api[_-]?key|auth[_-]?token|client[_-]?secret|session[_-]?token)\s*[=:]\s*)[^\s"'']+', '$1[REDACTED]', 'IgnoreCase')
+    $s = [regex]::Replace($s, '(-----BEGIN [A-Z ]*PRIVATE KEY-----).*', '$1[REDACTED]', 'IgnoreCase')
     $s = [regex]::Replace($s, '\b(sk-[A-Za-z0-9_-]{12,}|ghp_[A-Za-z0-9]{20,}|github_pat_[A-Za-z0-9_]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16})\b', '[REDACTED]')
     return $s
 }
@@ -170,7 +193,8 @@ function Limit-Text {
 function ConvertTo-MdCell {
     param([string]$Text)
     if ($null -eq $Text) { return '' }
-    $s = ($Text -replace "`r?`n", ' ')
+    $s = Sanitize-Text $Text
+    $s = ($s -replace "`r?`n", ' ')
     $s = $s -replace '\|', '\|'
     if ($s.Length -gt 500) { $s = $s.Substring(0, 500) + '…' }
     return $s
@@ -193,15 +217,17 @@ function Add-CheckRow {
 function Add-Block {
     param([string]$Phase, [string]$Reason)
     if ($script:FailurePhase -eq 'NONE') { $script:FailurePhase = $Phase }
-    $script:Blocks.Add("$Phase|$Reason")
-    [Console]::Error.WriteLine("ERROR: $Reason")
+    $clean = Limit-Text $Reason 6 500
+    $script:Blocks.Add("$Phase|$clean")
+    [Console]::Error.WriteLine("ERROR: $clean")
 }
 
 function Add-Degraded {
     param([string]$Phase, [string]$Reason)
     if ($script:FailurePhase -eq 'NONE') { $script:FailurePhase = $Phase }
-    $script:Degraded.Add("$Phase|$Reason")
-    Write-WarnLine $Reason
+    $clean = Limit-Text $Reason 6 500
+    $script:Degraded.Add("$Phase|$clean")
+    Write-WarnLine $clean
 }
 
 function Add-Confirmed([string]$Text) { $script:Confirmed.Add('- ' + (Limit-Text $Text 3 500)) }
@@ -330,6 +356,7 @@ function Initialize-Environment {
 function Get-HermesCommandInfo {
     $commands = @(Get-Command hermes -All -ErrorAction SilentlyContinue)
     $script:HeremesCommand = $commands | Select-Object -First 1
+    $script:HeremesCliPresent = ($commands.Count -gt 0)
     if ($null -ne $script:HeremesCommand) {
         if (-not [string]::IsNullOrEmpty($script:HeremesCommand.Source)) {
             $script:HeremesPath = $script:HeremesCommand.Source
@@ -340,12 +367,15 @@ function Get-HermesCommandInfo {
         }
     }
     $candidate = Join-Path $env:LOCALAPPDATA 'hermes\hermes-agent'
-    if (Test-Path (Join-Path $candidate '.git')) {
+    if ((Test-Path -LiteralPath $candidate -PathType Container) -or (Test-Path -LiteralPath (Join-Path $candidate '.git'))) {
         $script:SourceCheckout = $candidate
     }
+    $localHermesRoot = Join-Path $env:LOCALAPPDATA 'hermes'
     $cliLooksSource = $false
     if (-not [string]::IsNullOrEmpty($script:HeremesPath)) {
-        if ($script:HeremesPath -notmatch '\\WindowsApps\\') { $cliLooksSource = $true }
+        if (($script:HeremesPath -like "$localHermesRoot\*") -and ($script:HeremesPath -notmatch '\\WindowsApps\\')) {
+            $cliLooksSource = $true
+        }
     }
     $script:SourcePresent = [bool]($script:SourceCheckout -or $cliLooksSource)
 }
@@ -356,27 +386,87 @@ function Get-AppxInfo {
         Add-Block 'WINDOWS_PACKAGE' 'Get-AppxPackage is unavailable in this PowerShell session; package ownership cannot be proven.'
         return
     }
-    $packages = @(Get-AppxPackage -Name $script:AppxName -ErrorAction SilentlyContinue)
-    $script:AppxCount = $packages.Count
-    if ($packages.Count -eq 1) {
-        $script:AppxPackage = $packages[0]
-        $observedVersion = $script:AppxPackage.Version.ToString()
-        if ($AfterUpdate) {
+    try {
+        $allPackages = @(Get-AppxPackage -ErrorAction Stop)
+    } catch {
+        Add-Block 'WINDOWS_PACKAGE' "Get-AppxPackage failed; package ownership cannot be proven: $($_.Exception.Message)"
+        return
+    }
+    $hermesPackages = @($allPackages | Where-Object {
+        ($_.Name -match '(?i)hermes') -or ($_.PackageFamilyName -match '(?i)hermes')
+    })
+    $script:AppxCount = $hermesPackages.Count
+    $script:AppxOwnerCandidate = 'None'
+    $script:AppxIssue = ''
+    $script:AppxIdentities = ''
+    if ($hermesPackages.Count -eq 0) {
+        if ($AfterUpdate) { $script:InstalledVersionAfter = 'absent' }
+        return
+    }
+    $script:AppxIdentities = (($hermesPackages | ForEach-Object {
+        "$($_.Name)@$($_.Version)[$($_.SignatureKind)] publisher=$($_.Publisher)"
+    }) -join '; ')
+
+    $storePackages = @($hermesPackages | Where-Object { $_.Name -eq $script:StoreAppxName })
+    $bundledPackages = @($hermesPackages | Where-Object { $_.Name -eq $script:BundledAppxName })
+    $unknownPackages = @($hermesPackages | Where-Object {
+        ($_.Name -ne $script:StoreAppxName) -and ($_.Name -ne $script:BundledAppxName)
+    })
+
+    if ($unknownPackages.Count -gt 0) {
+        $script:AppxOwnerCandidate = 'Unknown'
+        $script:AppxIssue = "Unrecognized Hermes package identity: $($script:AppxIdentities)"
+    } elseif (($storePackages.Count + $bundledPackages.Count) -ne 1) {
+        $script:AppxOwnerCandidate = 'Unknown'
+        $script:AppxIssue = "Multiple or ambiguous Hermes MSIX packages are registered: $($script:AppxIdentities)"
+    }
+
+    $observed = $hermesPackages[0]
+    if ($storePackages.Count -eq 1) { $observed = $storePackages[0] }
+    elseif ($bundledPackages.Count -eq 1) { $observed = $bundledPackages[0] }
+    $script:AppxPackage = $observed
+    $observedVersion = $observed.Version.ToString()
+    if ($AfterUpdate) {
+        $script:InstalledVersionAfter = $observedVersion
+    } else {
+        $script:InstalledVersion = $observedVersion
+        if ($script:InstalledVersionAfter -eq 'not applicable') {
             $script:InstalledVersionAfter = $observedVersion
-        } else {
-            $script:InstalledVersion = $observedVersion
-            if ($script:InstalledVersionAfter -eq 'not applicable') {
-                $script:InstalledVersionAfter = $observedVersion
+        }
+    }
+    $script:PackageIdentity = $observed.PackageFullName
+    $script:PackagePublisher = $observed.Publisher
+    $script:SignatureKind = [string]$observed.SignatureKind
+
+    if ($script:AppxIssue -eq '') {
+        if ($storePackages.Count -eq 1) {
+            $pkg = $storePackages[0]
+            if ([string]$pkg.SignatureKind -ne 'Store') {
+                $script:AppxOwnerCandidate = 'Unknown'
+                $script:AppxIssue = "Store package identity '$($pkg.Name)' is not Store-signed (SignatureKind=$($pkg.SignatureKind))."
+            } elseif ([string]$pkg.Publisher -ne $script:StorePublisher) {
+                $script:AppxOwnerCandidate = 'Unknown'
+                $script:AppxIssue = "Store package publisher '$($pkg.Publisher)' does not match the official Store publisher."
+            } else {
+                $script:AppxOwnerCandidate = 'Microsoft Store'
+            }
+        } elseif ($bundledPackages.Count -eq 1) {
+            $pkg = $bundledPackages[0]
+            $sig = [string]$pkg.SignatureKind
+            if (($sig -ne 'Developer') -and ($sig -ne 'Enterprise')) {
+                $script:AppxOwnerCandidate = 'Unknown'
+                $script:AppxIssue = "Bundled package identity '$($pkg.Name)' is not a signed sideload (SignatureKind=$sig)."
+            } elseif ([string]$pkg.Publisher -notmatch $script:SideloadPublisherPattern) {
+                $script:AppxOwnerCandidate = 'Unknown'
+                $script:AppxIssue = "Bundled package publisher '$($pkg.Publisher)' is not the official Nous Research sideload publisher."
+            } else {
+                $script:AppxOwnerCandidate = 'Sideload MSIX'
             }
         }
-        $script:PackageIdentity = $script:AppxPackage.PackageFullName
-        $script:PackagePublisher = $script:AppxPackage.Publisher
-        $script:SignatureKind = [string]$script:AppxPackage.SignatureKind
-    } elseif ($packages.Count -gt 1) {
-        Add-Block 'WINDOWS_PACKAGE' "Multiple '$($script:AppxName)' packages are registered; the active Desktop owner is ambiguous."
-        $script:PackageIdentity = ($packages | ForEach-Object { $_.PackageFullName }) -join '; '
-    } elseif ($AfterUpdate) {
-        $script:InstalledVersionAfter = 'absent'
+    }
+
+    if ($AfterUpdate -and ($script:AppxIssue -ne '')) {
+        Add-Block 'WINDOWS_PACKAGE' $script:AppxIssue
     }
 }
 
@@ -387,6 +477,7 @@ function Get-SourceVersion {
     $out = $script:NativeOutput
     Add-Timeline 'WINDOWS_PACKAGE' 'hermes --version' "exit $exit" (($out -split "`r?`n" | Select-Object -First 1) -join ' ')
     if ($exit -eq 0) {
+        $script:SourceVersionOk = 'yes'
         $m = [regex]::Match($out, 'v?(\d+\.\d+\.\d+)')
         if ($m.Success) {
             if ($AfterUpdate) {
@@ -397,12 +488,130 @@ function Get-SourceVersion {
                     $script:InstalledVersionAfter = $script:InstalledVersion
                 }
             }
+        } else {
+            $script:SourceVersionOk = 'no'
+            Add-Degraded 'WINDOWS_PACKAGE' 'hermes --version did not contain a parseable vX.Y.Z version.'
         }
-        Add-CheckRow 'Hermes CLI version' 'discoverable' "v$($script:InstalledVersion) (after=$($script:InstalledVersionAfter))" 'PASS'
+        $dirMatch = [regex]::Match($out, '(?im)^Install directory:\s*(.+?)\s*$')
+        if ($dirMatch.Success) { $script:SourceInstallDirectory = $dirMatch.Groups[1].Value }
+        $methodMatch = [regex]::Match($out, '(?im)^Install method:\s*(\S+)')
+        if ($methodMatch.Success) { $script:SourceInstallMethod = $methodMatch.Groups[1].Value }
+        $channelMatch = [regex]::Match($out, '(?i)\b(stable|canary|main)\b')
+        if ($channelMatch.Success) { $script:SourceChannel = $channelMatch.Groups[1].Value.ToLowerInvariant() }
+        $versionVerdict = $(if ($script:SourceVersionOk -eq 'yes') { 'PASS' } else { 'FAIL' })
+        Add-CheckRow 'Hermes CLI version' 'discoverable' `
+            "v$($script:InstalledVersion) (after=$($script:InstalledVersionAfter)); method=$($script:SourceInstallMethod); channel=$($script:SourceChannel)" $versionVerdict
     } else {
+        $script:SourceVersionOk = 'no'
         Add-Degraded 'WINDOWS_PACKAGE' "hermes --version failed (exit $exit)."
         Add-CheckRow 'Hermes CLI version' 'discoverable' "exit $exit" 'FAIL'
     }
+}
+
+function Get-NormalizedPath {
+    param([string]$Path)
+    if ([string]::IsNullOrWhiteSpace($Path)) { return '' }
+    try {
+        return [IO.Path]::GetFullPath($Path).TrimEnd([char[]]@('\', '/'))
+    } catch {
+        return $Path.TrimEnd([char[]]@('\', '/'))
+    }
+}
+
+function Test-SourceProvenance {
+    if ($script:Owner -ne 'Source build') { return }
+    $issues = @()
+    if ($script:SourceVersionOk -ne 'yes') { $issues += 'hermes --version did not complete successfully; CLI provenance is unavailable.' }
+    if ([string]::IsNullOrEmpty($script:HeremesPath)) { $issues += 'hermes CLI path is missing.' }
+    if ([string]::IsNullOrEmpty($script:SourceCheckout)) { $issues += 'source checkout path is missing.' }
+    if (-not [string]::IsNullOrEmpty($script:HeremesPath)) {
+        $localRoot = Join-Path $env:LOCALAPPDATA 'hermes'
+        $cliInRoot = ($script:HeremesPath -like "$localRoot\*")
+        $wrapperReferencesCheckout = $false
+        if (-not $cliInRoot -and (Test-Path -LiteralPath $script:HeremesPath -PathType Leaf)) {
+            try {
+                $wrapperText = Get-Content -LiteralPath $script:HeremesPath -Raw -ErrorAction Stop
+                if ($wrapperText -match [regex]::Escape($script:SourceCheckout)) { $wrapperReferencesCheckout = $true }
+            } catch { $wrapperReferencesCheckout = $false }
+        }
+        if ((-not $cliInRoot) -and (-not $wrapperReferencesCheckout)) {
+            $issues += "resolved CLI '$($script:HeremesPath)' is outside the verified source install root and does not reference the checkout."
+        }
+    }
+    if ([string]::IsNullOrEmpty($script:SourceInstallDirectory)) {
+        $issues += 'hermes --version did not report an install directory.'
+    } else {
+        $cliDir = Get-NormalizedPath $script:SourceInstallDirectory
+        $expectedDir = Get-NormalizedPath $script:SourceCheckout
+        if ($cliDir -ine $expectedDir) {
+            $issues += "resolved CLI reports install directory '$script:SourceInstallDirectory', which does not belong to the discovered checkout '$script:SourceCheckout'."
+        }
+    }
+    if ($script:SourceInstallMethod -ne 'git') {
+        $issues += "install method '$($script:SourceInstallMethod)' is not a managed Git checkout."
+    }
+    if ($script:SourceChannel -ne 'stable') {
+        $issues += "installed update channel '$($script:SourceChannel)' is not stable."
+    }
+    if (($script:UpdateCheckChannel -ne 'unknown') -and ($script:UpdateCheckChannel -ne 'stable')) {
+        $issues += "update-check channel '$($script:UpdateCheckChannel)' is not stable."
+    }
+    if (($script:SourceChannel -ne 'unknown') -and ($script:UpdateCheckChannel -ne 'unknown') -and
+        ($script:SourceChannel -ne $script:UpdateCheckChannel)) {
+        $issues += "installed channel '$($script:SourceChannel)' disagrees with update-check channel '$($script:UpdateCheckChannel)'."
+    }
+    if (-not [string]::IsNullOrEmpty($script:SourceCheckout)) {
+        if (-not (Test-Path -LiteralPath (Join-Path $script:SourceCheckout '.git'))) {
+            $issues += "source checkout '$($script:SourceCheckout)' has no .git metadata."
+        }
+        $insideExit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'rev-parse', '--is-inside-work-tree')
+        if (($insideExit -ne 0) -or ($script:NativeOutput.Trim() -ne 'true')) {
+            $issues += "git rev-parse --is-inside-work-tree failed (exit $insideExit)."
+        }
+        $remoteExit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'remote', 'get-url', 'origin')
+        $remotes = @($script:NativeOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        $script:GitRemote = $(if ($remotes.Count -gt 0) { $remotes[0].Trim() } else { 'unknown' })
+        $officialRemote = '^(https://github\.com/NousResearch/hermes-agent(\.git)?|git@github\.com:NousResearch/hermes-agent(\.git)?|ssh://git@github\.com/NousResearch/hermes-agent(\.git)?)$'
+        if (($remoteExit -ne 0) -or ($script:GitRemote -notmatch $officialRemote)) {
+            $issues += "origin remote '$script:GitRemote' is not the official NousResearch/hermes-agent repository (exit $remoteExit)."
+        }
+        $branchExit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'symbolic-ref', '--short', '-q', 'HEAD')
+        $branchOut = $script:NativeOutput.Trim()
+        if ($branchExit -eq 0) {
+            $script:GitBranch = $branchOut
+            if ($branchOut -notin @('main', 'master')) {
+                $issues += "checkout is on custom branch '$branchOut'."
+            }
+        } elseif (($branchExit -eq 1) -and [string]::IsNullOrEmpty($branchOut)) {
+            $script:GitBranch = 'detached'
+        } else {
+            $issues += "checkout branch could not be read (exit $branchExit)."
+        }
+        $statusExit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'status', '--porcelain', '--untracked-files=normal')
+        if ($statusExit -ne 0) {
+            $script:GitDirty = 'unknown'
+            $issues += "git status failed (exit $statusExit); repository cleanliness cannot be proven."
+        } elseif (-not [string]::IsNullOrWhiteSpace($script:NativeOutput)) {
+            $script:GitDirty = 'yes'
+            $issues += "source checkout has uncommitted changes; refusing to reset/stash/assume clean."
+            Add-Evidence "git status: $(Limit-Text $script:NativeOutput 8 600)"
+        } else {
+            $script:GitDirty = 'no'
+        }
+    }
+
+    if ($issues.Count -eq 0) {
+        $script:SourceProvenanceOk = 'yes'
+        Add-CheckRow 'Source provenance' 'official checkout, stable channel, clean tree' `
+            "checkout=$($script:SourceCheckout); remote=$($script:GitRemote); branch=$($script:GitBranch); dirty=$($script:GitDirty)" 'PASS'
+    } else {
+        $script:SourceProvenanceOk = 'no'
+        foreach ($issue in $issues) { Add-Block 'PRECHECK' $issue }
+        Add-CheckRow 'Source provenance' 'official checkout, stable channel, clean tree' `
+            "remote=$($script:GitRemote); branch=$($script:GitBranch); dirty=$($script:GitDirty); issues=$($issues.Count)" 'FAIL'
+    }
+    Add-Timeline 'PRECHECK' 'source provenance' $script:SourceProvenanceOk `
+        "remote=$($script:GitRemote); branch=$($script:GitBranch); dirty=$($script:GitDirty)"
 }
 
 function Resolve-Owner {
@@ -413,31 +622,33 @@ function Resolve-Owner {
     if ($appxPresent -and $script:SourcePresent) {
         Add-Block 'WINDOWS_PACKAGE' "A source/CLI Hermes install and a registered MSIX package both exist. The active Desktop owner is unclear; refusing to choose or convert distributions."
         $script:Owner = 'Unknown (source + MSIX)'
-        $script:OwnerEvidence = "appx=$($script:AppxPackage.PackageFullName) sourceCli=$($script:HeremesPath) checkout=$($script:SourceCheckout)"
+        $script:OwnerEvidence = "appx=$($script:AppxIdentities) sourceCli=$($script:HeremesPath) checkout=$($script:SourceCheckout)"
         Add-CheckRow 'Desktop package owner' 'exactly one unambiguous owner' 'source + MSIX both present' 'FAIL'
         return
     }
 
     if ($appxPresent) {
-        if ($script:AppxCount -gt 1) {
-            $script:Owner = 'Unknown (multiple packages)'
-            Add-CheckRow 'Desktop package owner' 'exactly one unambiguous owner' 'multiple MSIX packages' 'FAIL'
+        if ($script:AppxIssue -ne '') {
+            Add-Block 'WINDOWS_PACKAGE' $script:AppxIssue
+            $script:Owner = 'Unknown (unrecognized MSIX ownership)'
+            $script:OwnerEvidence = $script:AppxIdentities
+            Add-CheckRow 'Desktop package owner' 'recognized official Store or sideload identity' $script:AppxIdentities 'FAIL'
             return
         }
-        $sig = $script:SignatureKind
-        if ($sig -eq 'Store') {
+        if ($script:AppxOwnerCandidate -eq 'Microsoft Store') {
             $script:Owner = 'Microsoft Store'
-        } elseif (($sig -eq 'Developer') -or ($sig -eq 'Enterprise')) {
+        } elseif ($script:AppxOwnerCandidate -eq 'Sideload MSIX') {
             $script:Owner = 'Sideload MSIX'
-            Add-Block 'WINDOWS_PACKAGE' "MSIX package SignatureKind is '$sig', not Store. A sideload update needs a verified official .appinstaller descriptor; none is assumed."
         } else {
-            $script:Owner = 'Unknown (unrecognized SignatureKind)'
-            Add-Block 'WINDOWS_PACKAGE' "Installed MSIX SignatureKind '$sig' cannot be proven to be Microsoft Store or a verified signed sideload."
+            Add-Block 'WINDOWS_PACKAGE' "Registered Hermes package ownership could not be classified: $($script:AppxIdentities)"
+            $script:Owner = 'Unknown (unclassified MSIX ownership)'
+            $script:OwnerEvidence = $script:AppxIdentities
+            Add-CheckRow 'Desktop package owner' 'recognized official Store or sideload identity' $script:AppxIdentities 'FAIL'
+            return
         }
         $script:OwnerEvidence = "Name=$($script:AppxPackage.Name); Version=$($script:InstalledVersion); Publisher=$($script:PackagePublisher); SignatureKind=$($script:SignatureKind); Family=$($script:AppxPackage.PackageFamilyName)"
         Add-CheckRow 'Desktop package owner' 'one verified distributor' `
-            "$($script:Owner); $($script:SignatureKind); v$($script:InstalledVersion)" `
-            $(if ($script:Owner -eq 'Microsoft Store') { 'PASS' } else { 'FAIL' })
+            "$($script:Owner); $($script:AppxPackage.Name); $($script:SignatureKind); v$($script:InstalledVersion)" 'PASS'
         return
     }
 
@@ -454,6 +665,18 @@ function Resolve-Owner {
         return
     }
 
+    if ($script:SourcePresent -and [string]::IsNullOrEmpty($script:HeremesPath)) {
+        $script:Owner = 'Unknown (source checkout without CLI)'
+        Add-Block 'WINDOWS_PACKAGE' "A source checkout exists at '$($script:SourceCheckout)' but no hermes CLI was resolved."
+        Add-CheckRow 'Desktop package owner' 'verified source checkout and CLI' 'checkout present; CLI missing' 'FAIL'
+        return
+    }
+    if ($script:HeremesCliPresent) {
+        $script:Owner = 'Unknown (unverified CLI)'
+        Add-Block 'WINDOWS_PACKAGE' "A hermes CLI was found at '$($script:HeremesPath)' but it is not tied to a verified source checkout or a recognized Store/sideload package."
+        Add-CheckRow 'Desktop package owner' 'verified installation owner' "unverified CLI: $($script:HeremesPath)" 'FAIL'
+        return
+    }
     $script:Owner = 'Not installed'
     Add-Block 'WINDOWS_PACKAGE' "No supported existing Hermes installation was found. Automatic bootstrap is not allowed."
     Add-CheckRow 'Desktop package owner' 'supported existing install' 'none' 'FAIL'
@@ -473,6 +696,8 @@ function Get-SourceUpdateAvailability {
     if ($m.Success) {
         $script:AvailableVersion = $m.Groups[1].Value
     }
+    $channelMatch = [regex]::Match($out, '(?i)Update channel:\s*(\S+)')
+    if ($channelMatch.Success) { $script:UpdateCheckChannel = $channelMatch.Groups[1].Value.ToLowerInvariant() }
     if ($out -match '(?i)no update|up[ -]?to[ -]?date|already current') {
         $script:UpdateAvailable = 'no'
         $script:DistributorState = 'source stable channel current'
@@ -492,6 +717,7 @@ function Get-SourceUpdateAvailability {
         $script:DistributorState = 'source stable channel'
     } else {
         $script:UpdateAvailable = 'unknown'
+        Add-Degraded 'WINDOWS_PACKAGE' 'Source update availability could not be parsed from the owner channel output.'
     }
     Add-CheckRow 'Source update availability' 'stable channel checked' `
         "installed v$($script:InstalledVersion); available v$($script:AvailableVersion); update=$($script:UpdateAvailable)" 'INFO'
@@ -542,56 +768,133 @@ function Get-StoreUpdateAvailability {
         "$($script:DistributorState); update=$($script:UpdateAvailable)" 'INFO'
 }
 
+function Read-AppInstallerDescriptor {
+    param([string]$Path)
+    $result = [pscustomobject]@{
+        Valid = $false
+        Reason = ''
+        Path = $Path
+        Name = ''
+        Version = ''
+        Publisher = ''
+        Uri = ''
+    }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        $result.Reason = "App Installer descriptor not found: $Path"
+        return $result
+    }
+    try {
+        $descriptorItem = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($descriptorItem.Length -gt 1MB) {
+            $result.Reason = 'App Installer descriptor exceeds the 1 MiB safety limit.'
+            return $result
+        }
+        $rawXml = Get-Content -LiteralPath $Path -Raw -ErrorAction Stop
+        $readerSettings = New-Object System.Xml.XmlReaderSettings
+        $readerSettings.DtdProcessing = [System.Xml.DtdProcessing]::Prohibit
+        $readerSettings.XmlResolver = $null
+        $stringReader = New-Object System.IO.StringReader($rawXml)
+        $xmlReader = [System.Xml.XmlReader]::Create($stringReader, $readerSettings)
+        $doc = New-Object System.Xml.XmlDocument
+        $doc.XmlResolver = $null
+        $doc.Load($xmlReader)
+        $xmlReader.Close()
+        $stringReader.Close()
+        $main = $doc.SelectSingleNode('/*[local-name()="AppInstaller"]/*[local-name()="MainPackage"]')
+        if ($null -eq $main) {
+            $result.Reason = 'The .appinstaller file has no MainPackage element.'
+            return $result
+        }
+        $result.Name = [string]$main.GetAttribute('Name')
+        $result.Version = [string]$main.GetAttribute('Version')
+        $result.Publisher = [string]$main.GetAttribute('Publisher')
+        $result.Uri = [string]$main.GetAttribute('Uri')
+    } catch {
+        $result.Reason = "Could not parse the App Installer descriptor: $($_.Exception.Message)"
+        return $result
+    }
+    if ([string]::IsNullOrEmpty($script:AppxPackage.Name)) {
+        $result.Reason = 'Installed package identity is unavailable; descriptor cannot be matched.'
+        return $result
+    }
+    if ($result.Name -ne $script:AppxPackage.Name) {
+        $result.Reason = "Descriptor identity '$($result.Name)' does not match installed package '$($script:AppxPackage.Name)'."
+        return $result
+    }
+    if ($result.Name -ne $script:BundledAppxName) {
+        $result.Reason = "Descriptor identity '$($result.Name)' is not the recognized official sideload identity."
+        return $result
+    }
+    if ($result.Publisher -ne $script:AppxPackage.Publisher) {
+        $result.Reason = "Descriptor publisher '$($result.Publisher)' does not match installed publisher '$($script:AppxPackage.Publisher)'."
+        return $result
+    }
+    if ([string]::IsNullOrWhiteSpace($result.Publisher) -or ($result.Publisher -notmatch $script:SideloadPublisherPattern)) {
+        $result.Reason = "Descriptor publisher '$($result.Publisher)' is not the official Nous Research sideload publisher."
+        return $result
+    }
+    $uri = $null
+    if (-not [Uri]::TryCreate($result.Uri, [UriKind]::Absolute, [ref]$uri) -or ($uri.Scheme -ne 'https') -or [string]::IsNullOrWhiteSpace($uri.Host)) {
+        $result.Reason = "Descriptor package URI is missing, not absolute, or not HTTPS."
+        return $result
+    }
+    if (-not [string]::IsNullOrEmpty($uri.UserInfo)) {
+        $result.Reason = "Descriptor package URI embeds credentials (userinfo)."
+        return $result
+    }
+    $proposed = $null
+    if (-not [version]::TryParse($result.Version, [ref]$proposed)) {
+        $result.Reason = "Descriptor version '$($result.Version)' is not a valid version."
+        return $result
+    }
+    if (($script:InstalledVersion -ne 'unknown') -and ((Compare-VersionStrings $result.Version $script:InstalledVersion) -lt 0)) {
+        $result.Reason = "Descriptor version $($result.Version) would downgrade installed v$($script:InstalledVersion)."
+        return $result
+    }
+    $result.Valid = $true
+    $result.Reason = 'identity, publisher, signed sideload ownership, HTTPS URI, and non-downgrade version verified'
+    return $result
+}
+
 function Get-SideloadDescriptorInfo {
     if ($script:Owner -ne 'Sideload MSIX') { return }
     $file = $AppInstallerFile
     if ([string]::IsNullOrWhiteSpace($file)) { $file = $env:HERMES_APPINSTALLER_FILE }
+    $script:SideloadDescriptorPath = $file
     if ([string]::IsNullOrWhiteSpace($file)) {
-        Add-Block 'WINDOWS_PACKAGE' "Sideload MSIX detected but no registered official App Installer descriptor could be discovered. Provide only a publisher-verified -AppInstallerFile; no fallback source build is allowed."
+        $script:SideloadDescriptorValid = $false
+        $script:SideloadDescriptorReason = 'No verified App Installer descriptor was supplied.'
         $script:UpdateAvailable = 'unknown'
         $script:DistributorState = 'no verified descriptor supplied'
-        Add-CheckRow 'Sideload update availability' 'publisher-verified official descriptor' 'not supplied/discoverable' 'FAIL'
+        Add-CheckRow 'Sideload update availability' 'publisher-verified official descriptor' 'not supplied' 'NOT_TESTED'
+        Add-Unknown 'Sideload availability is UNKNOWN: no verified descriptor was supplied, so no update is authorized.'
         return
     }
-    if (-not (Test-Path -LiteralPath $file -PathType Leaf)) {
-        Add-Block 'WINDOWS_PACKAGE' "App Installer descriptor not found: $file"
+    $descriptor = Read-AppInstallerDescriptor -Path $file
+    if (-not $descriptor.Valid) {
+        $script:SideloadDescriptorValid = $false
+        $script:SideloadDescriptorReason = $descriptor.Reason
         $script:UpdateAvailable = 'unknown'
+        $script:DistributorState = 'descriptor rejected'
+        Add-Block 'WINDOWS_PACKAGE' "Sideload descriptor rejected: $($descriptor.Reason)"
+        Add-CheckRow 'Sideload update availability' 'publisher-verified official descriptor' $descriptor.Reason 'FAIL'
         return
     }
-    try {
-        [xml]$xml = Get-Content -LiteralPath $file -Raw -ErrorAction Stop
-        $main = $xml.SelectSingleNode('/*[local-name()="AppInstaller"]/*[local-name()="MainPackage"]')
-        if ($null -eq $main) {
-            Add-Block 'WINDOWS_PACKAGE' "The .appinstaller file has no MainPackage element; refusing to install it."
-            $script:UpdateAvailable = 'unknown'
-            return
-        }
-        $name = [string]$main.GetAttribute('Name')
-        $version = [string]$main.GetAttribute('Version')
-        $publisher = [string]$main.GetAttribute('Publisher')
-        $uri = [string]$main.GetAttribute('Uri')
-        if ($name -ne $script:AppxPackage.Name) {
-            Add-Block 'WINDOWS_PACKAGE' "Descriptor identity '$name' does not match installed package '$($script:AppxPackage.Name)'."
-        }
-        if ($publisher -ne $script:AppxPackage.Publisher) {
-            Add-Block 'WINDOWS_PACKAGE' "Descriptor publisher '$publisher' does not match installed publisher '$($script:AppxPackage.Publisher)'."
-        }
-        if ([string]::IsNullOrWhiteSpace($uri) -or ($uri -notmatch '^https://')) {
-            Add-Block 'WINDOWS_PACKAGE' "Descriptor package URI is missing or not HTTPS; refusing an untrusted download."
-        }
-        if (($script:InstalledVersion -ne 'unknown') -and $version -and ((Compare-VersionStrings $version $script:InstalledVersion) -lt 0)) {
-            Add-Block 'WINDOWS_PACKAGE' "Descriptor version $version would downgrade installed v$($script:InstalledVersion)."
-        }
-        $script:AvailableVersion = $version
+    $script:SideloadDescriptorValid = $true
+    $script:SideloadDescriptorReason = $descriptor.Reason
+    $script:SideloadDescriptorVersion = $descriptor.Version
+    $script:AvailableVersion = $descriptor.Version
+    $cmp = Compare-VersionStrings $descriptor.Version $script:InstalledVersion
+    if ($cmp -eq 0) {
+        $script:UpdateAvailable = 'no'
+        $script:DistributorState = 'verified descriptor already current'
+    } else {
         $script:UpdateAvailable = 'yes'
         $script:DistributorState = 'verified descriptor supplied'
-        Add-Evidence "App Installer descriptor: path=$file identity=$name version=$version publisher=$publisher uri=$uri"
-        Add-CheckRow 'Sideload update availability' 'verified official descriptor, non-downgrade' `
-            "identity=$name version=$version" $(if ($script:Blocks.Count -eq 0) { 'PASS' } else { 'FAIL' })
-    } catch {
-        Add-Block 'WINDOWS_PACKAGE' "Could not parse the App Installer descriptor: $($_.Exception.Message)"
-        $script:UpdateAvailable = 'unknown'
     }
+    Add-Evidence "App Installer descriptor: path=$file identity=$($descriptor.Name) version=$($descriptor.Version) publisher=$($descriptor.Publisher) uri=$($descriptor.Uri)"
+    Add-CheckRow 'Sideload update availability' 'verified official descriptor, non-downgrade' `
+        "identity=$($descriptor.Name) version=$($descriptor.Version); $($descriptor.Reason)" 'PASS'
 }
 
 # ---------------------------------------------------------------------------
@@ -851,6 +1154,12 @@ function Invoke-SourceUpdate {
         Add-Block 'WINDOWS_PACKAGE' 'Source owner detected but no usable hermes CLI was found.'
         return
     }
+    Get-SourceVersion
+    Test-SourceProvenance
+    if ($script:SourceProvenanceOk -ne 'yes') {
+        Add-Block 'PRECHECK' 'Source provenance is not proven immediately before update; refusing to run the source updater.'
+        return
+    }
     $planExit = Invoke-Native $script:HeremesPath @('update', '--plan')
     Add-Timeline 'WINDOWS_PACKAGE' 'hermes update --plan' "exit $planExit" (($script:NativeOutput -split "`r?`n" | Select-Object -First 8) -join ' ')
     Add-Evidence "Update plan: $(Limit-Text $script:NativeOutput 10 900)"
@@ -910,7 +1219,7 @@ function Invoke-StoreUpdate {
         $script:DistributorState = 'NO_APPLICABLE_UPGRADE'
         $script:UpdateNeeded = $false
     }
-    $newPackages = @(Get-AppxPackage -Name $script:AppxName -ErrorAction SilentlyContinue)
+    $newPackages = @(Get-AppxPackage -Name $script:StoreAppxName -ErrorAction SilentlyContinue)
     if ($newPackages.Count -eq 1) {
         $script:InstalledVersionAfter = $newPackages[0].Version.ToString()
         $script:AppxPackage = $newPackages[0]
@@ -927,41 +1236,28 @@ function Invoke-StoreUpdate {
 
 function Invoke-SideloadUpdate {
     if ($script:Owner -ne 'Sideload MSIX') { return }
-    $file = $AppInstallerFile
-    if ([string]::IsNullOrWhiteSpace($file)) { $file = $env:HERMES_APPINSTALLER_FILE }
-    if ([string]::IsNullOrWhiteSpace($file) -or -not (Test-Path -LiteralPath $file -PathType Leaf)) {
-        Add-Block 'WINDOWS_PACKAGE' 'No verified .appinstaller descriptor is available; refusing sideload update and refusing a fallback installer.'
+    if (-not $script:SideloadDescriptorValid) {
+        Add-Block 'PRECHECK' "Sideload update is not authorized: $($script:SideloadDescriptorReason)"
+        return
+    }
+    Get-AppxInfo
+    if (($script:AppxIssue -ne '') -or ($script:AppxOwnerCandidate -ne 'Sideload MSIX')) {
+        Add-Block 'PRECHECK' "Installed package ownership changed or became ambiguous before update: $($script:AppxIssue)"
+        return
+    }
+    $file = $script:SideloadDescriptorPath
+    $descriptor = Read-AppInstallerDescriptor -Path $file
+    if (-not $descriptor.Valid) {
+        Add-Block 'PRECHECK' "Sideload descriptor changed or became invalid: $($descriptor.Reason)"
         return
     }
     try {
-        [xml]$xml = Get-Content -LiteralPath $file -Raw -ErrorAction Stop
-        $main = $xml.SelectSingleNode('/*[local-name()="AppInstaller"]/*[local-name()="MainPackage"]')
-        $uri = [string]$main.GetAttribute('Uri')
-        if ($uri -match '^https://') {
-            $req = [System.Net.HttpWebRequest]::Create($uri)
-            $req.Method = 'HEAD'
-            $req.Timeout = 10000
-            try {
-                $resp = $req.GetResponse()
-                $resp.Close()
-                Add-Timeline 'WINDOWS_PACKAGE' 'descriptor package URI HEAD' 'reachable' $uri
-            } catch {
-                Add-Block 'WINDOWS_PACKAGE' "Official descriptor URI is unreachable: $($_.Exception.Message). No fallback source is permitted."
-                return
-            }
-        }
         Add-Timeline 'WINDOWS_PACKAGE' 'Add-AppxPackage -AppInstallerFile' 'started' $file
         Add-AppxPackage -AppInstallerFile $file -ErrorAction Stop
         $script:UpdateExit = 0
         $script:UpdateNeeded = $true
         $script:Mutations = 'Add-AppxPackage -AppInstallerFile ' + $file
-        Start-Sleep -Seconds 2
-        $newPackages = @(Get-AppxPackage -Name $script:AppxName -ErrorAction SilentlyContinue)
-        if ($newPackages.Count -eq 1) {
-            $script:InstalledVersionAfter = $newPackages[0].Version.ToString()
-            $script:AppxPackage = $newPackages[0]
-        }
-        Add-Timeline 'WINDOWS_PACKAGE' 'Add-AppxPackage -AppInstallerFile' 'exit 0' "version now $($script:InstalledVersionAfter)"
+        Add-Timeline 'WINDOWS_PACKAGE' 'Add-AppxPackage -AppInstallerFile' 'exit 0' "descriptor version $($descriptor.Version)"
     } catch {
         $msg = $_.Exception.Message
         $script:UpdateExit = 1
@@ -969,6 +1265,10 @@ function Invoke-SideloadUpdate {
         Add-Timeline 'WINDOWS_PACKAGE' 'Add-AppxPackage -AppInstallerFile' 'failed' (Limit-Text $msg 6 500)
         if ($msg -match '0x80073D02|being used|in use|close') {
             Add-Block 'WINDOWS_PACKAGE' 'The signed package is in use. No process was killed; close Hermes gracefully and rerun.'
+        } elseif ($msg -match '(?i)0x80072|0x800c|network|name resolution|unreachable|connection|timed out|ssl|tls') {
+            Add-Block 'WINDOWS_PACKAGE' "Official descriptor feed was unavailable: $msg. No fallback source or installer is permitted."
+        } elseif ($msg -match '(?i)0x800b|signature|certificate|trust|publisher') {
+            Add-Block 'WINDOWS_PACKAGE' "Signed package validation failed: $msg. No fallback source or installer is permitted."
         } else {
             Add-Degraded 'WINDOWS_PACKAGE' "Sideload package installation failed: $msg"
         }
@@ -987,6 +1287,10 @@ function Set-CheckVerdict {
         $script:Status = 'DEGRADED'
         $script:ExitCode = 1
         $script:Summary = ($script:Degraded[0] -split '\|', 2)[1]
+    } elseif (($script:Owner -eq 'Sideload MSIX') -and (-not $script:SideloadDescriptorValid)) {
+        $script:Status = 'UNKNOWN'
+        $script:ExitCode = 1
+        $script:Summary = 'Sideload owner recognized, but package availability is unknown without a verified descriptor.'
     } elseif ([string]::IsNullOrWhiteSpace($script:BackendUrl)) {
         $script:Status = 'UNKNOWN'
         $script:ExitCode = 1
@@ -1022,7 +1326,7 @@ function Set-UpdateVerdict {
             Add-Degraded 'WINDOWS_PACKAGE' "Owner-specific updater exited $($script:UpdateExit); no retry was attempted."
         }
         if (($script:InstalledVersionAfter -eq 'unknown') -or ($script:InstalledVersionAfter -eq $script:InstalledVersion)) {
-            if (($script:DistributorState -ne 'NO_APPLICABLE_UPGRADE') -and ($script:Owner -ne 'Sideload MSIX')) {
+            if ($script:DistributorState -ne 'NO_APPLICABLE_UPGRADE') {
                 $problems++
                 Add-Degraded 'WINDOWS_PACKAGE' "Installed version did not advance from v$($script:InstalledVersion) (after=$($script:InstalledVersionAfter))."
             }
@@ -1077,6 +1381,13 @@ function Set-UpdateVerdict {
 # ---------------------------------------------------------------------------
 function Get-NextAction {
     param([string]$Phase)
+    if (($script:Owner -eq 'Sideload MSIX') -and (-not $script:SideloadDescriptorValid)) {
+        return @{
+            Action = 'Supply a publisher-verified official .appinstaller descriptor before checking availability or updating.'
+            Command = 'powershell.exe -NoProfile -File .\skills\hermes-windows\scripts\hermes.ps1 check -AppInstallerFile ''<verified.appinstaller>'''
+            Permission = 'No; the descriptor must come from the official signed publisher feed.'
+        }
+    }
     if ([string]::IsNullOrWhiteSpace($script:BackendUrl) -and ($script:Blocks.Count -eq 0)) {
         return @{
             Action = 'Supply the existing private backend URL so network/HTTP/authentication layers can be tested separately.'
@@ -1085,6 +1396,13 @@ function Get-NextAction {
         }
     }
     switch ($Phase) {
+        'PRECHECK' {
+            return @{
+                Action = 'Resolve the source provenance or preflight blocker before attempting any update.'
+                Command = 'powershell.exe -NoProfile -File .\skills\hermes-windows\scripts\hermes.ps1 check'
+                Permission = 'No; do not reset, stash, or clean the checkout to bypass the check.'
+            }
+        }
         'WINDOWS_PACKAGE' {
             return @{
                 Action = 'Resolve the first Windows package-owner/updater blocker, then rerun the owner-specific check.'
@@ -1162,9 +1480,9 @@ function Write-Report {
     [void]$sb.AppendLine("| Host / operating system | $(ConvertTo-MdCell $script:HostName) / $(ConvertTo-MdCell $script:OsName) build $($script:OsBuild) |")
     [void]$sb.AppendLine("| Effective account and supervisor scope | $(ConvertTo-MdCell $script:Account); PowerShell $($script:PsVersion) |")
     [void]$sb.AppendLine("| Hermes executable path | $(ConvertTo-MdCell $script:HeremesPath) |")
-    [void]$sb.AppendLine("| Installation type / Windows package owner | $($script:Owner) / $(ConvertTo-MdCell $script:SignatureKind) |")
+    [void]$sb.AppendLine("| Installation type / Windows package owner | $(ConvertTo-MdCell $script:Owner) / $(ConvertTo-MdCell $script:SignatureKind) |")
     [void]$sb.AppendLine("| Installed version before/after | v$(ConvertTo-MdCell $script:InstalledVersion) / $(ConvertTo-MdCell $versionAfter) |")
-    [void]$sb.AppendLine("| Upstream stable target / distributor channel | v$($script:AvailableVersion) / $(ConvertTo-MdCell $script:DistributorState) |")
+    [void]$sb.AppendLine("| Upstream stable target / distributor channel | v$(ConvertTo-MdCell $script:AvailableVersion) / $(ConvertTo-MdCell $script:DistributorState) |")
     [void]$sb.AppendLine("| Backend URL (no userinfo or tokens) | $(ConvertTo-MdCell $script:BackendUrlDisplay) ($(ConvertTo-MdCell $script:BackendUrlSource)) |")
     [void]$sb.AppendLine("| Mutations actually made | $(ConvertTo-MdCell $script:Mutations) |")
     [void]$sb.AppendLine('')
@@ -1190,14 +1508,14 @@ function Write-Report {
     [void]$sb.AppendLine('## 5. Exact errors and references')
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine("- **Error text (redacted, concise):** $(ConvertTo-MdCell $script:Summary)")
-    [void]$sb.AppendLine("- **Hermes receipt:** ``$(ConvertTo-MdCell $script:ReceiptPath)``; outcome=``$($script:ReceiptOutcome)``; followups=$($script:ReceiptFollowupCount); gateway_restart.incomplete=$($script:ReceiptGatewayIncomplete); fresh=$($script:ReceiptFresh)")
+    [void]$sb.AppendLine("- **Hermes receipt:** ``$(ConvertTo-MdCell $script:ReceiptPath)``; outcome=``$(ConvertTo-MdCell $script:ReceiptOutcome)``; followups=$($script:ReceiptFollowupCount); gateway_restart.incomplete=$(ConvertTo-MdCell $script:ReceiptGatewayIncomplete); fresh=$(ConvertTo-MdCell $script:ReceiptFresh)")
     if ($script:ReceiptFollowupText) {
         [void]$sb.AppendLine("- **Receipt follow-up detail:** $(ConvertTo-MdCell $script:ReceiptFollowupText)")
     }
     [void]$sb.AppendLine("- **Windows package identity:** $(ConvertTo-MdCell $script:PackageIdentity); publisher=$(ConvertTo-MdCell $script:PackagePublisher); SignatureKind=$(ConvertTo-MdCell $script:SignatureKind)")
     [void]$sb.AppendLine("- **Relevant Windows installer/WinGet error and exit code:** exit=$($script:UpdateExit); $(ConvertTo-MdCell (Limit-Text $script:UpdateOutput 5 600))")
     [void]$sb.AppendLine("- **HTTP status / response type / WebSocket close code, if tested:** HTTP $($script:HttpCode); type=$(ConvertTo-MdCell $script:HttpContentType); protocol=$($script:HttpProtocol); WS=$($script:WebSocketState)")
-    [void]$sb.AppendLine("- **Evidence files kept locally (do not upload automatically):** ``$($script:ReportPath)``")
+    [void]$sb.AppendLine("- **Evidence files kept locally (do not upload automatically):** ``$(ConvertTo-MdCell $script:ReportPath)``")
     foreach ($e in $script:Evidence) { [void]$sb.AppendLine($e) }
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('## 6. Diagnosis and impact')
@@ -1269,15 +1587,15 @@ function Write-Report {
 function Show-Summary {
     Write-Output ''
     Write-Output "STATUS: $($script:Status)"
-    Write-Output "SUMMARY: $($script:Summary)"
+    Write-Output "SUMMARY: $(Sanitize-Text $script:Summary)"
     if ($script:Status -in @('BLOCKED', 'FAILED', 'PARTIAL', 'DEGRADED', 'UNKNOWN')) {
         Write-Output "FAILURE PHASE: $($script:FailurePhase)"
     }
-    Write-Output "REPORT: $($script:ReportPath)"
-    Write-Output "OWNER: $($script:Owner); INSTALLED: v$($script:InstalledVersion)"
+    Write-Output "REPORT: $(Sanitize-Text $script:ReportPath)"
+    Write-Output "OWNER: $(Sanitize-Text $script:Owner); INSTALLED: v$(Sanitize-Text $script:InstalledVersion)"
     Write-Output "REMOTE: HTTP=$($script:HttpState); AUTH=$($script:AuthState); WS=$($script:WebSocketState)"
     if ($script:Operation -eq 'update' -and $script:Mutations -ne 'none') {
-        Write-Output "MUTATIONS: $($script:Mutations)"
+        Write-Output "MUTATIONS: $(Sanitize-Text $script:Mutations)"
     }
     Write-Output "EXIT: $($script:ExitCode)"
 }
@@ -1302,6 +1620,7 @@ function Main {
 
     if ($script:Owner -eq 'Source build') {
         Get-SourceUpdateAvailability
+        Test-SourceProvenance
     } elseif ($script:Owner -eq 'Microsoft Store') {
         Get-StoreUpdateAvailability
     } elseif ($script:Owner -eq 'Sideload MSIX') {
@@ -1352,22 +1671,12 @@ function Main {
         if ($script:UpdateAvailable -eq 'unknown') {
             Add-Block 'PRECHECK' 'Source update availability/target could not be established; refusing a blind update.'
         }
-        if (-not [string]::IsNullOrEmpty($script:SourceCheckout)) {
-            $gitDir = Join-Path $script:SourceCheckout '.git'
-            if (Test-Path $gitDir) {
-                $dirty = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'status', '--porcelain', '--untracked-files=normal')
-                if ($dirty -ne 0) {
-                    Add-Block 'PRECHECK' "git status failed for the source checkout (exit $dirty); refusing to update without provenance."
-                } elseif (-not [string]::IsNullOrWhiteSpace($script:NativeOutput)) {
-                    Add-Block 'PRECHECK' 'Source checkout has uncommitted changes; refusing to stash/reset user work.'
-                    Add-Evidence "git status: $(Limit-Text $script:NativeOutput 8 600)"
-                }
-                $branchExit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'symbolic-ref', '--short', '-q', 'HEAD')
-                if (($branchExit -eq 0) -and ($script:NativeOutput.Trim() -notin @('main', 'master', ''))) {
-                    Add-Block 'PRECHECK' "Source checkout is on custom branch '$($script:NativeOutput.Trim())'."
-                }
-            }
+        if ($script:SourceProvenanceOk -ne 'yes') {
+            Add-Block 'PRECHECK' 'Source provenance was not fully proven; refusing to run the source updater.'
         }
+    }
+    if (($script:Owner -eq 'Sideload MSIX') -and (-not $script:SideloadDescriptorValid)) {
+        Add-Block 'PRECHECK' "Sideload update is not authorized: $($script:SideloadDescriptorReason)"
     }
     if ($script:Blocks.Count -gt 0) {
         Set-UpdateVerdict
@@ -1376,7 +1685,7 @@ function Main {
         exit $script:ExitCode
     }
 
-    if (($script:Owner -eq 'Source build') -or ($script:Owner -eq 'Microsoft Store')) {
+    if (($script:Owner -eq 'Source build') -or ($script:Owner -eq 'Microsoft Store') -or ($script:Owner -eq 'Sideload MSIX')) {
         if ($script:UpdateAvailable -eq 'no') {
             $script:UpdateNeeded = $false
             $script:UpdateExit = 'not run'
@@ -1384,11 +1693,11 @@ function Main {
             Add-Timeline 'WINDOWS_PACKAGE' 'owner-specific update' 'not run' 'no update available in the owner channel'
         } elseif ($script:Owner -eq 'Source build') {
             Invoke-SourceUpdate
-        } else {
+        } elseif ($script:Owner -eq 'Microsoft Store') {
             Invoke-StoreUpdate
+        } else {
+            Invoke-SideloadUpdate
         }
-    } elseif ($script:Owner -eq 'Sideload MSIX') {
-        Invoke-SideloadUpdate
     }
 
     # Re-read package state and the remote endpoint after mutation.

@@ -77,7 +77,12 @@ Read-only discovery and inspection:
    reports HTTP, protocol and auth separately.
 6. Reads the newest native `update_*.json` receipt and treats unresolved
    `followups[]` or `gateway_restart.incomplete=true` as **not success**.
-7. Writes a redacted Markdown report under `reports/<host>/<UTC>-check.md`.
+7. Distinguishes `PASS`, `FAIL`, `NOT_TESTED`, and `UNKNOWN`. Missing essential
+   evidence (active backend without HTTP verification, no receipt evidence, or
+   incomplete profile inventory) yields `UNKNOWN`, never `HEALTHY`. An absent
+   optional backend unit remains optional and does not fail the host.
+8. Writes a redacted Markdown report under `reports/<host>/<UTC>-check.md`.
+   Every report field and console message is sanitized before output.
 
 No restart, migration, config write, package install, or credential change is
 allowed in `check`.

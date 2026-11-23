@@ -38,6 +38,7 @@ CHECK_ROWS="$TMP_RUN/check_rows.md"
 TIMELINE_ROWS="$TMP_RUN/timeline_rows.md"
 BLOCKED_FILE="$TMP_RUN/blocked.txt"
 DEGRADED_FILE="$TMP_RUN/degraded.txt"
+UNVERIFIED_FILE="$TMP_RUN/unverified.txt"
 CONFIRMED_FILE="$TMP_RUN/confirmed.txt"
 LIKELY_FILE="$TMP_RUN/likely.txt"
 UNKNOWN_FILE="$TMP_RUN/unknown.txt"
@@ -45,7 +46,7 @@ WORKS_FILE="$TMP_RUN/works.txt"
 AFFECTED_FILE="$TMP_RUN/affected.txt"
 WARNINGS_FILE="$TMP_RUN/warnings.txt"
 : >"$CHECK_ROWS" ; : >"$TIMELINE_ROWS" ; : >"$BLOCKED_FILE"
-: >"$DEGRADED_FILE" ; : >"$CONFIRMED_FILE" ; : >"$LIKELY_FILE"
+: >"$DEGRADED_FILE" ; : >"$UNVERIFIED_FILE" ; : >"$CONFIRMED_FILE" ; : >"$LIKELY_FILE"
 : >"$UNKNOWN_FILE" ; : >"$WORKS_FILE" ; : >"$AFFECTED_FILE" ; : >"$WARNINGS_FILE"
 
 # ---------------------------------------------------------------------------
@@ -86,6 +87,8 @@ GIT_BRANCH="unknown"
 GIT_HEAD="unknown"
 GIT_DIRTY="unknown"
 GIT_DIRTY_LINES=""
+GIT_STATUS_EXIT="not run"
+GIT_INTEGRITY_OK="unknown"
 CHECKOUT_OK="unknown"
 PROVENANCE_OK="unknown"
 DISK_FREE_MB="unknown"
@@ -154,9 +157,9 @@ GATEWAY_REFRESH_DETAIL=""
 # ---------------------------------------------------------------------------
 # Small helpers
 # ---------------------------------------------------------------------------
-say()  { printf '%s\n' "$*"; }
-warn() { printf 'WARN: %s\n' "$*" >&2; }
-err()  { printf 'ERROR: %s\n' "$*" >&2; }
+say()  { printf '%s\n' "$*" | sanitize_text; }
+warn() { printf 'WARN: %s\n' "$*" | sanitize_text >&2; }
+err()  { printf 'ERROR: %s\n' "$*" | sanitize_text >&2; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -176,11 +179,13 @@ head_lines() {
 # Redact credentials, URL userinfo, query secrets and common token shapes.
 sanitize_text() {
   sed -E \
-    -e 's#(https?://)[^/@[:space:]]+@#\1[REDACTED]@#g' \
-    -e 's#([?&](access_token|token|api[_-]?key|apikey|key|secret|password|passwd|signature|sig|auth|code)=)[^&[:space:]]+#\1[REDACTED]#g' \
+    -e 's#((https?|ssh|git)://)[^/@[:space:]]+@#\1[REDACTED]@#g' \
+    -e 's#([?&][^=[:space:]]+=)[^&[:space:]]+#\1[REDACTED]#g' \
+    -e 's#([?&](access_token|token|api[_-]?key|apikey|key|secret|password|passwd|signature|sig|auth|code|client_secret|session|jwt)=)[^&[:space:]]+#\1[REDACTED]#gI' \
     -e 's#([Aa]uthorization:[[:space:]]*).*#\1[REDACTED]#g' \
     -e 's#(Bearer[[:space:]]+)[A-Za-z0-9._~+/-]+=*#\1[REDACTED]#g' \
-    -e 's#(([Pp]assword|[Pp]asswd|[Tt]oken|[Ss]ecret|[Aa]pi[_-]?[Kk]ey|[Aa]uth[_-]?[Tt]oken)([[:space:]]*[=:][[:space:]]*))[^[:space:]"'\'']+#\1[REDACTED]#g' \
+    -e 's#(([Pp]assword|[Pp]asswd|[Tt]oken|[Ss]ecret|[Aa]pi[_-]?[Kk]ey|[Aa]uth[_-]?[Tt]oken|[Cc]lient[_-]?[Ss]ecret|[Ss]ession[_-]?[Tt]oken)([[:space:]]*[=:][[:space:]]*))[^[:space:]"'\'']+#\1[REDACTED]#g' \
+    -e 's#(-----BEGIN [A-Z ]*PRIVATE KEY-----).*#\1[REDACTED]#g' \
     -e 's#(sk-[A-Za-z0-9_-]{12,})#[REDACTED]#g' \
     -e 's#(ghp_[A-Za-z0-9]{20,})#[REDACTED]#g' \
     -e 's#(github_pat_[A-Za-z0-9_]{20,})#[REDACTED]#g' \
@@ -197,7 +202,9 @@ evidence() {
 }
 
 md_escape() {
-  printf '%s' "$1" | tr '\n\r' '  ' | sed 's/|/\\|/g'
+  local value
+  if [ "$#" -gt 0 ]; then value="$1"; else value=$(cat); fi
+  printf '%s' "$value" | sanitize_text | tr '\n\r' '  ' | sed 's/|/\\|/g'
 }
 
 record_timeline() {
@@ -225,6 +232,15 @@ add_degraded() {
   local phase="$1" reason="$2"
   if [ "$FAILURE_PHASE" = "NONE" ]; then FAILURE_PHASE="$phase"; fi
   printf '%s|%s\n' "$phase" "$(printf '%s' "$reason" | evidence 6 500)" >>"$DEGRADED_FILE"
+  warn "$reason"
+}
+
+# Essential evidence was not obtained. This is weaker than a failure but it is
+# not healthy: it prevents HEALTHY without inventing a service failure.
+add_unverified() {
+  local phase="$1" reason="$2"
+  if [ "$FAILURE_PHASE" = "NONE" ]; then FAILURE_PHASE="$phase"; fi
+  printf '%s|%s\n' "$phase" "$(printf '%s' "$reason" | evidence 6 500)" >>"$UNVERIFIED_FILE"
   warn "$reason"
 }
 
@@ -394,22 +410,59 @@ discover_hermes() {
 
 discover_git() {
   [ -n "$CHECKOUT" ] || return 0
-  if ! git -C "$CHECKOUT" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  local integrity_ok="yes"
+  capture 30 git -C "$CHECKOUT" rev-parse --is-inside-work-tree
+  if [ "$RUN_STATUS" -ne 0 ] || ! printf '%s' "$RUN_OUTPUT" | grep -Fxq true; then
+    GIT_INTEGRITY_OK="no"
     add_blocked PRECHECK "install directory '$CHECKOUT' is not a readable Git worktree"
     record_check_row "Git worktree" "readable official checkout" "not a Git worktree" "FAIL"
     return 0
   fi
-  GIT_REMOTE=$(git -C "$CHECKOUT" remote get-url origin 2>/dev/null || printf 'unknown')
-  GIT_BRANCH=$(git -C "$CHECKOUT" symbolic-ref --short -q HEAD 2>/dev/null || printf 'detached')
-  GIT_HEAD=$(git -C "$CHECKOUT" rev-parse --short=12 HEAD 2>/dev/null || printf 'unknown')
-  GIT_DIRTY_LINES=$(git -C "$CHECKOUT" status --porcelain --untracked-files=normal 2>/dev/null | head -n 8 || true)
-  if [ -n "$GIT_DIRTY_LINES" ]; then
-    GIT_DIRTY="yes"
+
+  capture 30 git -C "$CHECKOUT" remote get-url origin
+  if [ "$RUN_STATUS" -eq 0 ] && [ -n "$RUN_OUTPUT" ]; then
+    GIT_REMOTE=$(printf '%s\n' "$RUN_OUTPUT" | head -n 1)
   else
-    GIT_DIRTY="no"
+    GIT_REMOTE="unknown"
+    integrity_ok="no"
+    add_degraded PRECHECK "origin remote could not be read (git exit $RUN_STATUS)"
   fi
+
+  capture 30 git -C "$CHECKOUT" symbolic-ref --short -q HEAD
+  case "$RUN_STATUS" in
+    0) GIT_BRANCH=$(printf '%s\n' "$RUN_OUTPUT" | head -n 1); [ -n "$GIT_BRANCH" ] || { GIT_BRANCH="unknown"; integrity_ok="no"; } ;;
+    1) GIT_BRANCH="detached" ;;
+    *) GIT_BRANCH="unknown"; integrity_ok="no"; add_degraded PRECHECK "checkout branch could not be read (git exit $RUN_STATUS)" ;;
+  esac
+
+  capture 30 git -C "$CHECKOUT" rev-parse --short=12 HEAD
+  if [ "$RUN_STATUS" -eq 0 ] && [ -n "$RUN_OUTPUT" ]; then
+    GIT_HEAD=$(printf '%s\n' "$RUN_OUTPUT" | head -n 1)
+  else
+    GIT_HEAD="unknown"
+    integrity_ok="no"
+    add_degraded PRECHECK "HEAD revision could not be read (git exit $RUN_STATUS)"
+  fi
+
+  capture 60 git -C "$CHECKOUT" status --porcelain --untracked-files=normal
+  GIT_STATUS_EXIT="$RUN_STATUS"
+  if [ "$RUN_STATUS" -ne 0 ]; then
+    GIT_DIRTY="unknown"
+    GIT_DIRTY_LINES=""
+    integrity_ok="no"
+    add_degraded PRECHECK "git status failed (exit $RUN_STATUS); repository cleanliness cannot be proven"
+    add_confirmed "Repository status could not be read; it is not treated as clean"
+  else
+    GIT_DIRTY_LINES=$(printf '%s\n' "$RUN_OUTPUT" | sed '/^[[:space:]]*$/d' | head -n 8)
+    if [ -n "$GIT_DIRTY_LINES" ]; then
+      GIT_DIRTY="yes"
+    else
+      GIT_DIRTY="no"
+    fi
+  fi
+
   case "$GIT_REMOTE" in
-    https://github.com/NousResearch/hermes-agent|https://github.com/NousResearch/hermes-agent.git|git@github.com:NousResearch/hermes-agent.git|git@github.com:NousResearch/hermes-agent)
+    https://github.com/NousResearch/hermes-agent|https://github.com/NousResearch/hermes-agent.git|git@github.com:NousResearch/hermes-agent.git|git@github.com:NousResearch/hermes-agent|ssh://git@github.com/NousResearch/hermes-agent|ssh://git@github.com/NousResearch/hermes-agent.git)
       PROVENANCE_OK="yes" ;;
     *) PROVENANCE_OK="no" ;;
   esac
@@ -417,14 +470,22 @@ discover_git() {
     detached|main|master) CHECKOUT_OK="yes" ;;
     *) CHECKOUT_OK="no" ;;
   esac
+  [ "$integrity_ok" = yes ] && GIT_INTEGRITY_OK="yes" || GIT_INTEGRITY_OK="no"
+
+  local worktree_verdict="PASS"
+  [ "$GIT_DIRTY" = yes ] && worktree_verdict="FAIL"
+  [ "$GIT_DIRTY" = unknown ] && worktree_verdict="UNKNOWN"
   record_check_row "Git provenance" "official NousResearch/hermes-agent" "$GIT_REMOTE" \
     "$([ "$PROVENANCE_OK" = yes ] && echo PASS || echo FAIL)"
-  record_check_row "Git worktree" "clean, stable-compatible branch" "$GIT_BRANCH @ $GIT_HEAD; dirty=$GIT_DIRTY" \
-    "$([ "$GIT_DIRTY" = no ] && echo PASS || echo FAIL)"
-  record_timeline "L1" "git status/remote" "exit 0" "remote=$GIT_REMOTE branch=$GIT_BRANCH head=$GIT_HEAD dirty=$GIT_DIRTY"
+  record_check_row "Git worktree" "clean, stable-compatible branch" \
+    "$GIT_BRANCH @ $GIT_HEAD; dirty=$GIT_DIRTY; integrity=$GIT_INTEGRITY_OK" "$worktree_verdict"
+  record_timeline "L1" "git status" "exit $GIT_STATUS_EXIT" "remote=$GIT_REMOTE branch=$GIT_BRANCH head=$GIT_HEAD dirty=$GIT_DIRTY integrity=$GIT_INTEGRITY_OK"
   if [ "$GIT_DIRTY" = yes ]; then
     add_degraded PRECHECK "checkout has uncommitted changes (update would be unsafe; files were not touched)"
     add_confirmed "Checkout is dirty. First entries: $(printf '%s' "$GIT_DIRTY_LINES" | tr '\n' '; ' | evidence 2 400)"
+  fi
+  if [ "$GIT_INTEGRITY_OK" != yes ]; then
+    add_degraded PRECHECK "Git repository integrity/provenance could not be fully proven"
   fi
   if [ "$PROVENANCE_OK" != yes ]; then
     add_degraded PRECHECK "origin remote is not the official NousResearch/hermes-agent repository"
@@ -688,11 +749,17 @@ discover_units() {
     GATEWAY_EXEC=$(unit_show "$GATEWAY_SCOPE" "$GATEWAY_UNIT" ExecStart)
     if [ -z "$GATEWAY_USER" ] && [ "$GATEWAY_SCOPE" = user ]; then GATEWAY_USER="$EFFECTIVE_USER"; fi
     [ -n "$GATEWAY_USER" ] || GATEWAY_USER="root (systemd default)"
+    local gateway_verdict="FAIL"
+    if [ "$GATEWAY_ACTIVE" = active ] && [ -n "$GATEWAY_PID" ] && [ "$GATEWAY_PID" != "0" ] && [ "$GATEWAY_PID" != "unknown" ]; then
+      gateway_verdict="PASS"
+    fi
     record_check_row "Gateway service" "active/running" \
       "$GATEWAY_UNIT ($GATEWAY_SCOPE) $GATEWAY_ACTIVE/$GATEWAY_SUBSTATE pid=${GATEWAY_PID:-none} user=$GATEWAY_USER" \
-      "$([ "$GATEWAY_ACTIVE" = active ] && echo PASS || echo FAIL)"
+      "$gateway_verdict"
     if [ "$GATEWAY_ACTIVE" != active ]; then
       add_degraded GATEWAY "gateway unit $GATEWAY_UNIT is ${GATEWAY_ACTIVE:-unknown}/${GATEWAY_SUBSTATE:-unknown}"
+    elif [ -z "$GATEWAY_PID" ] || [ "$GATEWAY_PID" = "0" ] || [ "$GATEWAY_PID" = "unknown" ]; then
+      add_degraded GATEWAY "gateway unit $GATEWAY_UNIT is active but its MainPID is unavailable"
     fi
     local gw_user_effective="${GATEWAY_USER%% *}"
     if [ "$gw_user_effective" != "$EFFECTIVE_USER" ]; then
@@ -709,13 +776,18 @@ discover_units() {
     if [ -z "$SERVE_USER" ] && [ "$SERVE_SCOPE" = user ]; then SERVE_USER="$EFFECTIVE_USER"; fi
     [ -n "$SERVE_USER" ] || SERVE_USER="root (systemd default)"
     local serve_verdict="NOT_TESTED"
-    [ "$SERVE_ACTIVE" = active ] && serve_verdict="PASS"
-    [ "$SERVE_ACTIVE" = inactive ] && serve_verdict="FAIL"
+    if [ "$SERVE_ACTIVE" = active ] && [ -n "$SERVE_PID" ] && [ "$SERVE_PID" != "0" ] && [ "$SERVE_PID" != "unknown" ]; then
+      serve_verdict="PASS"
+    elif [ "$SERVE_ACTIVE" = active ] || [ "$SERVE_ACTIVE" = inactive ]; then
+      serve_verdict="FAIL"
+    fi
     record_check_row "Desktop backend service" "active/running" \
       "$SERVE_UNIT ($SERVE_SCOPE) $SERVE_ACTIVE/$SERVE_SUBSTATE pid=${SERVE_PID:-none} user=$SERVE_USER" \
       "$serve_verdict"
     if [ "$SERVE_ACTIVE" != active ]; then
       add_degraded SERVE_BACKEND "Desktop backend unit $SERVE_UNIT is ${SERVE_ACTIVE:-unknown}/${SERVE_SUBSTATE:-unknown}"
+    elif [ -z "$SERVE_PID" ] || [ "$SERVE_PID" = "0" ] || [ "$SERVE_PID" = "unknown" ]; then
+      add_degraded SERVE_BACKEND "Desktop backend unit $SERVE_UNIT is active but its MainPID is unavailable"
     fi
     local sv_user_effective="${SERVE_USER%% *}"
     if [ "$sv_user_effective" != "$EFFECTIVE_USER" ]; then
@@ -776,7 +848,11 @@ recompute_profile_counts() {
   EXPECTED_PROFILE_COUNT="$expected_n"
   SERVED_PROFILE_COUNT="$served_n"
   MISSING_PROFILES="$missing"
-  if [ "$expected_n" -gt 0 ] && [ -z "$missing" ]; then
+  if [ "$expected_n" -eq 0 ]; then
+    PROFILES_OK="unknown"
+  elif [ -z "$SERVED_PROFILES" ]; then
+    PROFILES_OK="unknown"
+  elif [ -z "$missing" ]; then
     PROFILES_OK="yes"
   else
     PROFILES_OK="no"
@@ -812,12 +888,16 @@ discover_profiles() {
     SERVED_PROFILES="$served"
   fi
   recompute_profile_counts
+  local profile_verdict="UNKNOWN"
+  [ "$PROFILES_OK" = yes ] && profile_verdict="PASS"
+  [ "$PROFILES_OK" = no ] && profile_verdict="FAIL"
   record_check_row "Expected / served profiles" "$EXPECTED_PROFILE_COUNT expected" \
-    "$SERVED_PROFILE_COUNT served; missing=${MISSING_PROFILES:-none}" \
-    "$([ "$PROFILES_OK" = yes ] && echo PASS || echo FAIL)"
+    "$SERVED_PROFILE_COUNT served; missing=${MISSING_PROFILES:-none}" "$profile_verdict"
   if [ -n "$MISSING_PROFILES" ]; then
     add_degraded GATEWAY "expected profile(s) not served: $MISSING_PROFILES"
     add_affected "Profile(s) not served: $MISSING_PROFILES (multiplexed gateway may intentionally park duplicates; verify before changing)"
+  elif [ "$PROFILES_OK" = unknown ]; then
+    add_unverified GATEWAY "profile inventory is incomplete; expected/served profiles could not be proven"
   fi
   record_timeline "L2" "hermes profile list" "$PROFILE_LIST_STATUS" "served=${served:-none}"
 }
@@ -918,8 +998,13 @@ discover_backend_url() {
 probe_backend() {
   if [ -z "$BACKEND_URL" ]; then
     HTTP_CHECK="NOT_TESTED"
-    record_check_row "Backend HTTP + JSON" "GET /api/status" "no verified backend URL" "NOT_TESTED"
-    add_unknown "Desktop backend URL was not discoverable and none was supplied"
+    if [ "$SERVE_UNIT_EXISTS" = yes ] && [ "$SERVE_ACTIVE" = active ]; then
+      record_check_row "Backend HTTP + JSON" "GET /api/status" "backend active but URL not discovered" "UNKNOWN"
+      add_unverified SERVE_BACKEND "backend service is active but HTTP health was not verified (no verified URL)"
+    else
+      record_check_row "Backend HTTP + JSON" "GET /api/status" "no verified backend URL" "NOT_TESTED"
+      add_unknown "Desktop backend URL was not discoverable and none was supplied"
+    fi
     return 0
   fi
   BACKEND_URL_DISPLAY=$(printf '%s' "$BACKEND_URL" | sanitize_text)
@@ -1039,7 +1124,13 @@ PY
 # Native update receipt -----------------------------------------------------
 discover_receipt() {
   local receipt_dir="$HERMES_HOME_DIR/logs/update_receipts"
-  [ -d "$receipt_dir" ] || { RECEIPT_PATH="none"; RECEIPT_CHECK="NOT_TESTED"; return 0; }
+  if [ ! -d "$receipt_dir" ]; then
+    RECEIPT_PATH="none"
+    RECEIPT_CHECK="NOT_TESTED"
+    record_check_row "Update receipt" "update receipt evidence" "receipt directory absent" "UNKNOWN"
+    add_unverified RECEIPT "no native update receipt evidence was available; updater follow-ups could not be checked"
+    return 0
+  fi
   local newest="" latest="$receipt_dir/latest.json" latest_kind=""
   newest=$(find "$receipt_dir" -maxdepth 1 -type f -name 'update_*.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)
   if [ -f "$latest" ]; then
@@ -1061,7 +1152,8 @@ PY
   if [ -z "$newest" ]; then
     RECEIPT_PATH="none"
     RECEIPT_CHECK="NOT_TESTED"
-    record_check_row "Update receipt" "update_*.json or latest.json present" "none" "NOT_TESTED"
+    record_check_row "Update receipt" "update_*.json or latest.json present" "none" "UNKNOWN"
+    add_unverified RECEIPT "no native update receipt evidence was available; updater follow-ups could not be checked"
     return 0
   fi
   RECEIPT_PATH="$newest"
@@ -1151,15 +1243,19 @@ collect_all() {
 # Decisions
 # ---------------------------------------------------------------------------
 decide_check() {
-  local blocks degraded
+  local blocks degraded unverified
   blocks=$(count_lines "$BLOCKED_FILE")
   degraded=$(count_lines "$DEGRADED_FILE")
+  unverified=$(count_lines "$UNVERIFIED_FILE")
   if [ "$blocks" -gt 0 ]; then
     STATUS="BLOCKED" ; EXIT_CODE=2
     SUMMARY=$(head -n 1 "$BLOCKED_FILE" | cut -d'|' -f2-)
   elif [ "$degraded" -gt 0 ]; then
     STATUS="DEGRADED" ; EXIT_CODE=1
     SUMMARY=$(head -n 1 "$DEGRADED_FILE" | cut -d'|' -f2-)
+  elif [ "$unverified" -gt 0 ]; then
+    STATUS="UNKNOWN" ; EXIT_CODE=1
+    SUMMARY=$(head -n 1 "$UNVERIFIED_FILE" | cut -d'|' -f2-)
   else
     STATUS="HEALTHY" ; EXIT_CODE=0
     if [ "$UPDATE_AVAILABLE" = yes ]; then
@@ -1182,7 +1278,8 @@ update_preflight() {
   if [ "$PROVENANCE_OK" != yes ]; then add_blocked PRECHECK "not an official NousResearch/hermes-agent checkout ('$GIT_REMOTE')"; fi
   if [ "$INSTALL_KIND" != git ]; then add_blocked PRECHECK "install method '$INSTALL_KIND' is not a managed git checkout"; fi
   if [ "$CHANNEL" != stable ]; then add_blocked PRECHECK "update channel is '$CHANNEL', not stable"; fi
-  if [ "$GIT_DIRTY" = yes ]; then add_blocked PRECHECK "checkout is dirty; refusing to stash/reset user changes (see git status evidence)"; fi
+  if [ "$GIT_INTEGRITY_OK" != yes ]; then add_blocked PRECHECK "Git repository integrity could not be proven; refusing update"; fi
+  if [ "$GIT_DIRTY" != no ]; then add_blocked PRECHECK "checkout cleanliness is '$GIT_DIRTY'; refusing to stash/reset/assume clean (see git status evidence)"; fi
   if [ "$CHECKOUT_OK" != yes ]; then add_blocked PRECHECK "checkout is on custom branch '$GIT_BRANCH'"; fi
   if [ "$UPDATE_AVAILABLE" = downgrade ]; then add_blocked PRECHECK "stable target v$STABLE_TARGET is older than installed v$HERMES_VERSION"; fi
   if [ "$UPDATE_AVAILABLE" = unknown ]; then add_blocked PRECHECK "update availability/target could not be established"; fi
@@ -1372,7 +1469,7 @@ decide_update() {
       fi
     fi
   fi
-  if [ "$HTTP_CHECK" != PASS ]; then
+  if { [ "$SERVE_UNIT_EXISTS" = yes ] || [ -n "$BACKEND_URL_ARG" ]; } && [ "$HTTP_CHECK" != PASS ]; then
     problems=$((problems + 1))
     add_degraded PROTOCOL "post-update backend HTTP check is '$HTTP_CHECK' (HTTP ${HTTP_CODE:-unknown})"
   fi
@@ -1452,9 +1549,15 @@ next_action_for_phase() {
       NEXT_PERMISSION="No."
       ;;
     RECEIPT)
-      NEXT_ACTION="Read the native receipt follow-ups and complete the exact deferred step; exit code 0 alone is not success."
-      NEXT_COMMAND="jq '{outcome,followups,gateway_restart}' ${RECEIPT_PATH:-<receipt>}"
-      NEXT_PERMISSION="No; reading evidence only."
+      if [ "$RECEIPT_PATH" = "none" ]; then
+        NEXT_ACTION="Establish whether a native update receipt exists for this install before claiming update health; do not fabricate or edit one."
+        NEXT_COMMAND="ls -la \"$HERMES_HOME_DIR/logs/update_receipts\" 2>&1 || true"
+        NEXT_PERMISSION="No; reading evidence only."
+      else
+        NEXT_ACTION="Read the native receipt follow-ups and complete the exact deferred step; exit code 0 alone is not success."
+        NEXT_COMMAND="jq '{outcome,followups,gateway_restart}' $RECEIPT_PATH"
+        NEXT_PERMISSION="No; reading evidence only."
+      fi
       ;;
     *)
       NEXT_ACTION="Rerun the read-only check and inspect the first failed row."
@@ -1501,7 +1604,7 @@ write_report() {
     printf '| Backend URL (no userinfo or tokens) | %s (source: %s) |\n' "$(md_escape "${BACKEND_URL_DISPLAY:-not discovered}")" "$(md_escape "$BACKEND_URL_SOURCE")"
     printf '| Mutations actually made | %s |\n\n' "$(md_escape "$MUTATIONS")"
     printf '## 3. Expected vs actual\n\n'
-    printf '| Check | Expected | Actual | PASS/FAIL/NOT_TESTED |\n|---|---|---|---|\n'
+    printf '| Check | Expected | Actual | PASS/FAIL/NOT_TESTED/UNKNOWN |\n|---|---|---|---|\n'
     cat "$CHECK_ROWS"
     printf '\n## 4. Timeline and last successful step\n\n'
     printf '| Step | Command or verification | Exit/status | Sanitized evidence |\n|---|---|---|---|\n'
@@ -1531,11 +1634,11 @@ write_report() {
       "$(md_escape "$HTTP_CODE")" "$(md_escape "$HTTP_CONTENT_TYPE")" "$(md_escape "$HTTP_PROTOCOL")"
     printf -- '- **Evidence files kept locally (do not upload automatically):** `%s`; updater output kept only as a bounded redacted excerpt\n\n' "$(md_escape "$REPORT_PATH")"
     printf '## 6. Diagnosis and impact\n\n'
-    printf '**Recorded blockers and degradations (exact reasons):**\n\n'
-    if [ -s "$BLOCKED_FILE" ] || [ -s "$DEGRADED_FILE" ]; then
+    printf '**Recorded blockers, degradations, and unverified essentials (exact reasons):**\n\n'
+    if [ -s "$BLOCKED_FILE" ] || [ -s "$DEGRADED_FILE" ] || [ -s "$UNVERIFIED_FILE" ]; then
       while IFS='|' read -r phase reason; do
-        [ -n "$phase" ] && printf -- '- [%s] %s\n' "$phase" "$reason"
-      done < <(cat "$BLOCKED_FILE" "$DEGRADED_FILE" 2>/dev/null)
+        [ -n "$phase" ] && printf -- '- [%s] %s\n' "$phase" "$(printf '%s' "$reason" | md_escape)"
+      done < <(cat "$BLOCKED_FILE" "$DEGRADED_FILE" "$UNVERIFIED_FILE" 2>/dev/null)
     else
       printf -- '- None.\n'
     fi
@@ -1548,7 +1651,7 @@ write_report() {
     printf '\n**What still works:**\n\n'
     if [ -s "$WORKS_FILE" ]; then cat "$WORKS_FILE"; else printf -- '- Not established.\n'; fi
     printf '\n**What is degraded / number of affected profiles:**\n\n'
-    printf -- '- Expected profiles: %s; served: %s; missing: %s\n' "$EXPECTED_PROFILE_COUNT" "$SERVED_PROFILE_COUNT" "${MISSING_PROFILES:-none}"
+    printf -- '- Expected profiles: %s; served: %s; missing: %s\n' "$EXPECTED_PROFILE_COUNT" "$SERVED_PROFILE_COUNT" "$(printf '%s' "${MISSING_PROFILES:-none}" | md_escape)"
     if [ -s "$AFFECTED_FILE" ]; then cat "$AFFECTED_FILE"; fi
     printf '\n**Any service stopped or left running:**\n\n'
     printf -- '- Gateway `%s` is `%s`; backend `%s` is `%s`.\n' \

@@ -57,10 +57,18 @@ The script inspects, at runtime:
 
 - `Get-Command hermes -All` and a source checkout at
   `%LOCALAPPDATA%\hermes\hermes-agent\.git`.
-- `Get-AppxPackage -Name 'NousResearch.HermesBundled'`, including
-  `SignatureKind`, `Publisher`, `Version`, and package identity.
+- Registered Hermes Appx packages, including `SignatureKind`, `Publisher`,
+  `Version`, and identity. The official identities are:
+  - Microsoft Store: `NousResearchInc.HermesAgent`, Store-signed, publisher
+    `CN=EE6D86E4-606F-4E38-B940-AD7248C9D519`.
+  - Sideload/bundled: `NousResearch.HermesBundled`, Developer/Enterprise-signed,
+    publisher `CN=Nous Research Inc.` (prefix).
 - `winget list --id 9PMXK8CZC7KR --exact --source msstore --upgrade-available`
   for Store-channel availability.
+
+Any other Hermes package identity, a signature/identity mismatch, or both
+official MSIX identities at once is blocked. The exact Store product ID remains
+`9PMXK8CZC7KR`.
 
 It then selects exactly one owner:
 
@@ -96,17 +104,20 @@ No package mutation, process kill, GUI launch, or saved-URL edit occurs.
 
 ## What `update` does
 
-- **Source:** preflight (`hermes update --plan`, clean checkout, stable channel,
-  no downgrade), one `hermes update --set-channel stable --yes`, independent
-  version/receipt checks, and a headless `hermes desktop --build-only
-  --force-build` **only** if output or receipt proves a missing/failed Desktop
-  build.
+- **Source:** preflight (`hermes update --plan`, resolved CLI install directory
+  matching the discovered checkout, official NousResearch Git remote, clean
+  tree, stable channel, no downgrade), one
+  `hermes update --set-channel stable --yes`, independent version/receipt
+  checks, and a headless `hermes desktop --build-only --force-build` **only** if
+  output or receipt proves a missing/failed Desktop build.
 - **Store:** exact product ID `9PMXK8CZC7KR` with `--source msstore`, then
   re-reads `Get-AppxPackage`. `NO_APPLICABLE_UPGRADE` is its own outcome.
   Locked packages are reported with process evidence, never killed.
 - **Sideload:** only a publisher-verified `.appinstaller` whose identity,
-  publisher, HTTPS URI, and non-downgrade version all match the installed
-  package. An unreachable feed is `BLOCKED`; there is no fallback installer.
+  publisher, HTTPS URI, non-downgrade version, and signed-sideload ownership
+  all match. A missing descriptor is `UNKNOWN` in check mode and blocks update;
+  a rejected descriptor or unreachable feed is `BLOCKED`. There is no fallback
+  installer.
 - After any update, re-checks package/CLI version, source receipt follow-ups,
   DNS/TCP/HTTP, and marks WebSocket `NOT_TESTED` unless truly exercised.
 
@@ -145,7 +156,8 @@ or raw logs.
   authenticated WebSocket/session is `NOT_TESTED` unless a documented terminal
   credential path is supplied.
 - Sideload descriptor discovery is not standardized; without
-  `-AppInstallerFile` the script returns `BLOCKED` rather than guessing a feed.
+  `-AppInstallerFile` check reports `UNKNOWN` and update is `BLOCKED` rather
+  than guessing a feed.
 - WinGet output formats and exit codes are distributor/version dependent; the
   script records the raw bounded output for diagnosis.
 - The script cannot prove the Linux host state; run the Linux skill separately

@@ -157,8 +157,16 @@ case "${1:-}" in
         if grep -q 'v0.23.3' "$fixtures/version.txt"; then cat "$fixtures/update_current.txt"; else cat "$fixtures/update_check.txt"; fi ;;
       --plan)
         rev=$(git -C "$FAKE_CHECKOUT" rev-parse --short=8 HEAD)
-        printf 'Update plan:\n  Install: git (v%s @ %s)\n  Profiles: default, alpha, beta\n  Running services to restart (2):\n    • gateway [default] pid %s — systemd @ %s\n      restart: systemctl restart (drain-first SIGUSR1 when supported)\n    • dashboard [default] pid %s — systemd\n      restart: systemctl restart (drain-first SIGUSR1 when supported)\n' \
-          "$(current_version)" "$rev" "$(cat "$FAKE_SBX/pids/gateway")" "$rev" "$(cat "$FAKE_SBX/pids/serve")" ;;
+        {
+          echo "Update plan:"
+          printf '  Install: git (v%s @ %s)\n' "$(current_version)" "$rev"
+          [ ! -f "$fixtures/no_plan_profiles" ] && echo "  Profiles: default, alpha, beta"
+          echo "  Running services to restart (2):"
+          printf '    • gateway [default] pid %s — systemd @ %s\n' "$(cat "$FAKE_SBX/pids/gateway")" "$rev"
+          echo "      restart: systemctl restart (drain-first SIGUSR1 when supported)"
+          printf '    • dashboard [default] pid %s — systemd\n' "$(cat "$FAKE_SBX/pids/serve")"
+          echo "      restart: systemctl restart (drain-first SIGUSR1 when supported)"
+        } ;;
       --set-channel)
         if [ -f "$fixtures/update_fail" ]; then echo "simulated updater failure"; exit 1; fi
         cp "$fixtures/version_after.txt" "$fixtures/version.txt"
@@ -186,7 +194,10 @@ case "${1:-}" in
       migrate) cat "$fixtures/migrate.txt" ;;
       *) echo "unsupported gateway args: $*" >&2; exit 9 ;;
     esac ;;
-  profile) [ "${2:-}" = list ] && cat "$fixtures/profile_list.txt" || exit 9 ;;
+  profile)
+    if [ "${2:-}" != list ]; then exit 9; fi
+    if [ -f "$fixtures/profile_list_fail" ]; then echo "profile listing unavailable" >&2; exit 1; fi
+    cat "$fixtures/profile_list.txt" ;;
   doctor) cat "$fixtures/doctor.txt" ;;
   pm) echo '{"outcome":"ok","followups":[]}' ;;
   *) echo "unexpected hermes args: $*" >&2; exit 9 ;;
@@ -228,6 +239,9 @@ case "$cmd" in
         pid=$(cat "$FAKE_SBX/pids/serve" 2>/dev/null || echo 0)
         desc="Hermes Desktop Remote Gateway"
         exec="{ path=$FAKE_CHECKOUT/.hermes/bin/hermes ; argv[]=$FAKE_CHECKOUT/.hermes/bin/hermes dashboard --host 127.0.0.1 --port 9119 --no-open ; }"
+        if [ -f "$fixtures/serve_no_bind" ]; then
+          exec="{ path=$FAKE_CHECKOUT/.hermes/bin/hermes ; argv[]=$FAKE_CHECKOUT/.hermes/bin/hermes dashboard --host 127.0.0.1 --no-open ; }"
+        fi
         ;;
       hermes-tunnel.service)
         pid=999
@@ -283,8 +297,20 @@ MOCK
   # ss mock -----------------------------------------------------------------
   cat >"$SBX/bin/ss" <<'MOCK'
 #!/usr/bin/env bash
+if [ -f "$FAKE_SBX/fixtures/serve_no_bind" ]; then exit 0; fi
 pid=$(cat "$FAKE_SBX/pids/serve")
 printf 'LISTEN 0 2048 127.0.0.1:9119 0.0.0.0:* users:(("hermes",pid=%s,fd=9))\n' "$pid"
+MOCK
+
+  # git mock: delegates to real git, with a controllable status failure.
+  REAL_GIT=$(command -v git)
+  cat >"$SBX/bin/git" <<MOCK
+#!/usr/bin/env bash
+if [ "\${1:-}" = "-C" ] && [ "\${3:-}" = "status" ] && [ -f "\$FAKE_SBX/fixtures/git_status_fail" ]; then
+  echo "fatal: unable to read repository" >&2
+  exit 128
+fi
+exec "$REAL_GIT" "\$@"
 MOCK
 
   # loginctl mock -----------------------------------------------------------
@@ -558,6 +584,84 @@ EOF
   assert_contains "user scope recorded" "gateway=user backend=user" "$report"
 }
 
+test_check_git_status_failure() {
+  new_sandbox check_git_status_fail
+  : >"$SBX/fixtures/git_status_fail"
+  run_script "$SBX" check
+  assert_eq "git status failure check exit" "1" "$(status_of "$SBX")"
+  assert_contains "git status failure not healthy" "STATUS: DEGRADED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "git status failure recorded" "git status" "$report"
+}
+
+test_update_git_status_failure() {
+  new_sandbox update_git_status_fail
+  : >"$SBX/fixtures/git_status_fail"
+  run_script "$SBX" update
+  assert_eq "git status failure update exit" "2" "$(status_of "$SBX")"
+  assert_contains "git status failure blocks update" "STATUS: BLOCKED" "$SBX/stdout.txt"
+  assert_eq "git status failure made no update call" "0" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+}
+
+test_check_missing_receipt() {
+  new_sandbox check_missing_receipt
+  rm -rf "$SBX/home/.hermes/logs/update_receipts"
+  run_script "$SBX" check
+  assert_eq "missing receipt exit" "1" "$(status_of "$SBX")"
+  assert_contains "missing receipt not healthy" "STATUS: UNKNOWN" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "missing receipt recorded" "receipt" "$report"
+}
+
+test_check_backend_unverified() {
+  new_sandbox check_backend_unverified
+  : >"$SBX/fixtures/serve_no_bind"
+  run_script "$SBX" check
+  assert_eq "unverified backend exit" "1" "$(status_of "$SBX")"
+  assert_contains "unverified backend not healthy" "STATUS: UNKNOWN" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "unverified backend recorded" "HTTP health was not verified" "$report"
+}
+
+test_check_optional_backend_absent() {
+  new_sandbox check_backend_absent
+  cat >"$SBX/fixtures/sys_units.txt" <<'EOF'
+hermes-gateway.service enabled enabled
+hermes-tunnel.service enabled enabled
+EOF
+  run_script "$SBX" check
+  assert_eq "optional backend absent exit" "0" "$(status_of "$SBX")"
+  assert_contains "optional backend absent healthy" "STATUS: HEALTHY" "$SBX/stdout.txt"
+}
+
+test_check_incomplete_profiles() {
+  new_sandbox check_incomplete_profiles
+  : >"$SBX/fixtures/no_plan_profiles"
+  : >"$SBX/fixtures/profile_list_fail"
+  rm -rf "$SBX/home/.hermes/profiles"
+  run_script "$SBX" check
+  assert_eq "incomplete profiles exit" "1" "$(status_of "$SBX")"
+  assert_contains "incomplete profiles not healthy" "STATUS: UNKNOWN" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "incomplete profiles recorded" "profile inventory" "$report"
+}
+
+test_check_redaction_git_remote() {
+  new_sandbox check_redaction_remote
+  git -C "$SBX/checkout" remote set-url origin 'https://user:supersecret-git-credential@github.com/NousResearch/hermes-agent.git'
+  run_script "$SBX" check
+  local report
+  report=$(report_of "$SBX")
+  assert_not_contains "git credential not in report" "supersecret-git-credential" "$report"
+  assert_not_contains "git credential not in stdout" "supersecret-git-credential" "$SBX/stdout.txt"
+  assert_not_contains "git credential not in stderr" "supersecret-git-credential" "$SBX/stderr.txt"
+  assert_contains "git credential redacted in report" "[REDACTED]" "$report"
+}
+
 test_check_redaction() {
   new_sandbox check_redaction
   cat >"$SBX/fixtures/gateway_status.txt" <<'EOF'
@@ -597,6 +701,13 @@ test_check_no_backup_rejected
 test_check_latest_plugin_check_ignored
 test_check_latest_update_receipt_used
 test_check_user_scope_units
+test_check_git_status_failure
+test_update_git_status_failure
+test_check_missing_receipt
+test_check_backend_unverified
+test_check_optional_backend_absent
+test_check_incomplete_profiles
+test_check_redaction_git_remote
 test_check_redaction
 
 printf '\n== Result: %d passed, %d failed ==\n' "$PASS" "$FAIL"

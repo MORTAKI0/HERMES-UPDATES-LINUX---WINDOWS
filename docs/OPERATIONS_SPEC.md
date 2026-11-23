@@ -70,7 +70,7 @@ The unit names above come from the intended deployment and **must be discovered*
 | Remote URL | port 9119, Tailscale IP or hostname | actual unit/config and Desktop connection setting |
 | Optional local model API | port 8642 | separate surface; do not treat as Desktop health |
 | Multiple profiles | more than one | `hermes profile list`, served-profile inventory |
-| Windows source/package owner | **unknown** | `Get-Command hermes -All`, `Get-AppxPackage`, WinGet, `hermes doctor` where valid |
+| Windows source/package owner | **unknown** | `Get-Command hermes -All`, Hermes Appx identities (`NousResearchInc.HermesAgent` Store, `NousResearch.HermesBundled` sideload), WinGet, `hermes doctor` where valid |
 
 **Never embed a real IP, API key, password, access token, or profile credentials in this repository.** Runtime URLs come from explicit arguments/environment or an existing verified configuration.
 
@@ -268,11 +268,23 @@ Read-only PowerShell evidence:
 
 ```powershell
 Get-Command hermes -All -ErrorAction SilentlyContinue
-Get-AppxPackage -Name 'NousResearch.HermesBundled'
+Get-AppxPackage | Where-Object { $_.Name -match 'Hermes' }
 winget list --id 9PMXK8CZC7KR --exact --source msstore
 ```
 
-For source installs, also verify `%LOCALAPPDATA%\hermes\hermes-agent\.git`, selected CLI provenance, and `hermes doctor` where available. A source/bootstrap installer (`Hermes-Setup.exe` / official `install.ps1`) is **not** an MSIX just because it runs a Desktop executable.
+The official Store identity is `NousResearchInc.HermesAgent` (Store-signed,
+publisher `CN=EE6D86E4-606F-4E38-B940-AD7248C9D519`). The official out-of-store
+sideload identity is `NousResearch.HermesBundled` (Developer/Enterprise-signed,
+publisher `CN=Nous Research Inc.`). Any other Hermes identity, a signature or
+publisher mismatch, or both official variants at once is ambiguous and must be
+blocked.
+
+For source installs, also verify `%LOCALAPPDATA%\hermes\hermes-agent\.git`, that
+the resolved CLI reports that same install directory with `Install method: git`,
+the official NousResearch Git remote, a clean tree, the stable channel, and
+`hermes doctor` where available. A source/bootstrap installer (`Hermes-Setup.exe`
+/ official `install.ps1`) is **not** an MSIX just because it runs a Desktop
+executable.
 
 | Detection | Correct owner | Allowed update |
 |---|---|---|
@@ -294,7 +306,7 @@ For source installs, also verify `%LOCALAPPDATA%\hermes\hermes-agent\.git`, sele
 3. Determine update availability using the **right owner**, without changing package state:
    - source → `hermes update --check`;
    - Store → `winget list/upgrade --available` with exact product/source filtering; WinGet may return “no applicable upgrade,” which can mean *already current in the Store channel* or *not offered here* — do not equate with GitHub stable;
-   - sideload → only read the registered/publisher-verified official descriptor; if unreachable, `UNKNOWN` not current.
+   - sideload → only read and validate the registered/publisher-verified official descriptor; missing descriptor is `UNKNOWN`, rejected descriptor or unavailable feed is `BLOCKED`, never current-by-assumption.
 4. Validate explicit/verified Linux backend URL (`HERMES_DESKTOP_REMOTE_URL` can override saved Desktop selection). Avoid logging the Desktop's saved authentication credentials.
 5. Check network/Tailscale if available, then `GET /api/status`. Classify **TCP reachable / Hermes JSON / auth advertised** separately.
 6. If existing approved credentials and a documented terminal-capable WebSocket test path are available, test the authenticated `/api/ws` handshake and record success; **never scrape/decrypt saved Desktop tokens just to claim full health**. Without this proof mark WebSocket/session `NOT_TESTED`.
@@ -337,7 +349,7 @@ Re-read `Get-AppxPackage` and the Store upgrade listing. Handle WinGet's `NO_APP
 
 ### C. Sideload MSIX Desktop
 
-1. Discover the actual registered App Installer source / official publisher feed. Verify **HTTPS host**, package identity, package version, and Microsoft-trusted signature through Windows package validation.
+1. Discover the actual registered App Installer source / official publisher feed. Verify **HTTPS host**, official sideload identity `NousResearch.HermesBundled`, publisher matching the installed Nous Research package, package version, non-downgrade, and Microsoft-trusted signature through Windows package validation. A missing descriptor is `UNKNOWN` in check mode and blocks update; a rejected descriptor is `BLOCKED`.
 2. Only if the official signed `.appinstaller` descriptor is reachable and proposes a non-downgrade, use Windows `Add-AppxPackage -AppInstallerFile` through PowerShell.
 3. Validate installed package version afterward; if the publisher feed is unavailable, **BLOCKED**, with the failed URL/HTTP or transport error and no fallback source build.
 
@@ -482,7 +494,7 @@ All values in this example are **hypothetical**. Reports must always use actual 
 
 - [ ] Parses in Windows PowerShell 5.1; real execution tested on Windows 11, not Linux-only static inspection.
 - [ ] Source, Store, sideload, ambiguous dual install, and unknown owner branches each tested.
-- [ ] Verifies package identity; never uses source CLI to update MSIX; never silently migrates owner.
+- [ ] Verifies Store identity `NousResearchInc.HermesAgent` and sideload identity `NousResearch.HermesBundled`; blocks unknown/dual identities; never uses source CLI to update MSIX; never silently migrates owner.
 - [ ] Checks `$LASTEXITCODE` on native commands; handles WinGet “no applicable upgrade” truthfully.
 - [ ] Official sideload source unreachable produces `BLOCKED` without fallback.
 - [ ] Running GUI lock results in targeted diagnosis, not blanket process termination.
@@ -552,6 +564,7 @@ No PR/branch management, UI, dashboard, multi-host remote execution, extra depen
 7. Hermes official latest stable release: https://github.com/NousResearch/hermes-agent/releases/latest
 8. Microsoft — WinGet upgrade: https://learn.microsoft.com/en-us/windows/package-manager/winget/upgrade
 9. Microsoft — Add-AppxPackage: https://learn.microsoft.com/en-us/powershell/module/appx/add-appxpackage
+10. Hermes Desktop product identity (Store vs sideload MSIX): https://github.com/NousResearch/hermes-agent/blob/main/apps/desktop/product-identity.cjs
 
 **Freshness rule:** inspect the current official docs and `hermes update --help` on the installed version before relying on an argument that may have changed. Do not silently use `main` or canary because a public doc becomes inconsistent. If docs and installed commands disagree, record both, stop before potentially destructive actions, and propose a safe compatibility path.
 
