@@ -113,13 +113,17 @@ No package mutation, process kill, GUI launch, or saved-URL edit occurs.
 - **Store:** exact product ID `9PMXK8CZC7KR` with `--source msstore`, then
   re-reads `Get-AppxPackage`. `NO_APPLICABLE_UPGRADE` is its own outcome.
   Locked packages are reported with process evidence, never killed.
-- **Sideload:** only a publisher-verified `.appinstaller` whose identity,
-  publisher, HTTPS URI, non-downgrade version, and signed-sideload ownership
-  all match. A missing descriptor is `UNKNOWN` in check mode and blocks update;
-  a rejected descriptor or unreachable feed is `BLOCKED`. There is no fallback
-  installer.
-- After any update, re-checks package/CLI version, source receipt follow-ups,
-  DNS/TCP/HTTP, and marks WebSocket `NOT_TESTED` unless truly exercised.
+- **Sideload:** only a publisher-verified `.appinstaller` whose `MainPackage`
+  or `MainBundle` identity, publisher, HTTPS URI, non-downgrade version, and
+  signed-sideload ownership all match. A missing descriptor is `UNKNOWN` in
+  check mode and blocks update; a rejected, ambiguous, or unreachable
+  descriptor is `BLOCKED`. There is no fallback installer.
+- After any package update, independently verifies the expected package is
+  still installed, its owner/identity/publisher are unchanged, and its version
+  is valid, non-downgraded, and satisfies the descriptor target where
+  applicable. Missing, ambiguous, invalid, or non-advancing packages are never
+  reported as success. It also re-checks source receipts, DNS/TCP/HTTP, and
+  marks WebSocket `NOT_TESTED` unless truly exercised.
 
 ## Arguments and exit codes
 

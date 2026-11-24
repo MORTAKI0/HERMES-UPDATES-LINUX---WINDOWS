@@ -199,9 +199,11 @@ function Get-CimInstance {
 }
 function Get-MockHermesPackage {
     param([string]$Name, [string]$Version, [string]$Publisher, [string]$SignatureKind)
+    $versionValue = $Version
+    try { $versionValue = [version]$Version } catch { $versionValue = $Version }
     [pscustomobject]@{
         Name = $Name
-        Version = [version]$Version
+        Version = $versionValue
         Publisher = $Publisher
         SignatureKind = $SignatureKind
         PackageFullName = "$Name`_$Version`_neutral__test"
@@ -213,9 +215,14 @@ function Get-AppxPackage {
     [CmdletBinding()]
     param([string]$Name, [switch]$AllUsers)
     $mode = $env:MOCK_APPX_MODE
-    if ($mode -eq 'none') { return }
+    if (($mode -eq 'none') -or (($env:MOCK_APPX_DISAPPEAR -eq '1') -and ($env:MOCK_APPX_UPDATED -eq '1'))) { return }
     $version = '0.23.2'
-    if ($env:MOCK_APPX_UPDATED -eq '1') { $version = '0.23.3' }
+    if ($env:MOCK_APPX_UPDATED -eq '1') {
+        $version = '0.23.3'
+        if (-not [string]::IsNullOrWhiteSpace($env:MOCK_APPX_UPDATED_VERSION)) {
+            $version = $env:MOCK_APPX_UPDATED_VERSION
+        }
+    }
     $store = Get-MockHermesPackage -Name 'NousResearchInc.HermesAgent' -Version $version -Publisher 'CN=EE6D86E4-606F-4E38-B940-AD7248C9D519' -SignatureKind 'Store'
     $sideload = Get-MockHermesPackage -Name 'NousResearch.HermesBundled' -Version $version -Publisher 'CN=Nous Research Inc., O=Nous Research Inc., L=Austin, S=Texas, C=US' -SignatureKind 'Developer'
     $unknown = Get-MockHermesPackage -Name 'Contoso.HermesClone' -Version $version -Publisher 'CN=Contoso' -SignatureKind 'Developer'
@@ -229,6 +236,7 @@ function Get-AppxPackage {
         'sideload_bad_sig' { $sideload.SignatureKind = 'Store'; $packages = @($sideload) }
         default { $packages = @() }
     }
+    if (($mode -eq 'sideload') -and ($env:MOCK_APPX_OWNER_CHANGE -eq '1') -and ($env:MOCK_APPX_UPDATED -eq '1')) { $packages = @($store) }
     if (-not [string]::IsNullOrWhiteSpace($Name)) {
         return @($packages | Where-Object { $_.Name -eq $Name })
     }
@@ -238,7 +246,12 @@ function Add-AppxPackage {
     [CmdletBinding()]
     param([string]$AppInstallerFile)
     Add-Content -LiteralPath $env:MOCK_CALL_LOG -Value "Add-AppxPackage $AppInstallerFile"
-    if ($env:MOCK_APPX_FAIL -eq '1') { throw '0x80072EE7: The server name or address could not be resolved' }
+    switch ($env:MOCK_APPX_FAIL_MODE) {
+        'network' { throw '0x80072EE7: The server name or address could not be resolved' }
+        'signature' { throw '0x800B0109: A certificate chain processed but terminated in a root certificate which is not trusted' }
+        'lock' { throw '0x80073D02: The package could not be installed because resources it modifies are currently in use' }
+        'generic' { throw 'Generic simulated package installation failure' }
+    }
     $env:MOCK_APPX_UPDATED = '1'
 }
 '@
@@ -259,7 +272,10 @@ function Invoke-Sandbox {
         [string]$SourceChannel = 'stable',
         [string]$SourceMethod = 'git',
         [string]$UpdateChannel = 'stable',
-        [string]$AppxFail = '0'
+        [string]$AppxFailMode = '',
+        [string]$AppxDisappear = '0',
+        [string]$AppxOwnerChange = '0',
+        [string]$AppxUpdatedVersion = ''
     )
     if ([string]::IsNullOrWhiteSpace($InstallDir)) {
         $InstallDir = Join-Path $Sandbox.LocalAppData 'hermes\hermes-agent'
@@ -291,7 +307,10 @@ function Invoke-Sandbox {
     $oldSourceChannel = $env:MOCK_SOURCE_CHANNEL
     $oldSourceMethod = $env:MOCK_SOURCE_METHOD
     $oldUpdateChannel = $env:MOCK_UPDATE_CHANNEL
-    $oldAppxFail = $env:MOCK_APPX_FAIL
+    $oldAppxFailMode = $env:MOCK_APPX_FAIL_MODE
+    $oldAppxDisappear = $env:MOCK_APPX_DISAPPEAR
+    $oldAppxOwnerChange = $env:MOCK_APPX_OWNER_CHANGE
+    $oldAppxUpdatedVersion = $env:MOCK_APPX_UPDATED_VERSION
     $oldAppxUpdated = $env:MOCK_APPX_UPDATED
     try {
         $env:PATH = "$($Sandbox.LocalAppData)\hermes\bin;$($Sandbox.Bin);$env:SystemRoot\System32;$env:SystemRoot"
@@ -313,7 +332,10 @@ function Invoke-Sandbox {
         $env:MOCK_SOURCE_CHANNEL = $SourceChannel
         $env:MOCK_SOURCE_METHOD = $SourceMethod
         $env:MOCK_UPDATE_CHANNEL = $UpdateChannel
-        $env:MOCK_APPX_FAIL = $AppxFail
+        $env:MOCK_APPX_FAIL_MODE = $AppxFailMode
+        $env:MOCK_APPX_DISAPPEAR = $AppxDisappear
+        $env:MOCK_APPX_OWNER_CHANGE = $AppxOwnerChange
+        $env:MOCK_APPX_UPDATED_VERSION = $AppxUpdatedVersion
         $env:MOCK_APPX_UPDATED = ''
         $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String
         $code = $LASTEXITCODE
@@ -337,7 +359,10 @@ function Invoke-Sandbox {
         $env:MOCK_SOURCE_CHANNEL = $oldSourceChannel
         $env:MOCK_SOURCE_METHOD = $oldSourceMethod
         $env:MOCK_UPDATE_CHANNEL = $oldUpdateChannel
-        $env:MOCK_APPX_FAIL = $oldAppxFail
+        $env:MOCK_APPX_FAIL_MODE = $oldAppxFailMode
+        $env:MOCK_APPX_DISAPPEAR = $oldAppxDisappear
+        $env:MOCK_APPX_OWNER_CHANGE = $oldAppxOwnerChange
+        $env:MOCK_APPX_UPDATED_VERSION = $oldAppxUpdatedVersion
         $env:MOCK_APPX_UPDATED = $oldAppxUpdated
     }
     $reportDir = Join-Path $Sandbox.Repo 'reports'
@@ -367,14 +392,20 @@ function New-AppInstallerDescriptor {
         [string]$Version = '0.23.3',
         [string]$Publisher = 'CN=Nous Research Inc., O=Nous Research Inc., L=Austin, S=Texas, C=US',
         [string]$Uri = 'https://example.invalid/HermesBundled-0.23.3.msixbundle',
-        [string]$FileName = 'valid.appinstaller'
+        [string]$FileName = 'valid.appinstaller',
+        [ValidateSet('MainPackage', 'MainBundle', 'Both', 'None')]
+        [string]$Kind = 'MainPackage'
     )
     $path = Join-Path $Sandbox.Dir $FileName
+    $package = "  <MainPackage Name=`"$Name`" Version=`"$Version`" Publisher=`"$Publisher`" Uri=`"$Uri`" />"
+    $bundle = "  <MainBundle Name=`"$Name`" Version=`"$Version`" Publisher=`"$Publisher`" Uri=`"$Uri`" />"
+    $body = ''
+    if (($Kind -eq 'MainPackage') -or ($Kind -eq 'Both')) { $body += $package + "`n" }
+    if (($Kind -eq 'MainBundle') -or ($Kind -eq 'Both')) { $body += $bundle + "`n" }
     $xml = @"
 <?xml version="1.0" encoding="utf-8"?>
 <AppInstaller xmlns="http://schemas.microsoft.com/appx/appinstaller/2017/2" Version="1.0.0.0">
-  <MainPackage Name="$Name" Version="$Version" Publisher="$Publisher" Uri="$Uri" />
-</AppInstaller>
+$body</AppInstaller>
 "@
     Set-Content -LiteralPath $path -Value $xml -Encoding UTF8
     return $path
@@ -515,6 +546,26 @@ try {
     Assert-Contains 'sideload valid row' 'verified official descriptor' $r.Report
     Assert-NotContains 'sideload valid no rejection' 'descriptor rejected' $r.Output
 
+    # 15b. MainBundle descriptors are valid; ambiguous/unsupported descriptors block.
+    $s = New-Sandbox 'sideload_mainbundle'
+    $descriptor = New-AppInstallerDescriptor $s -Kind MainBundle
+    $r = Invoke-Sandbox $s @('check', '-AppInstallerFile', $descriptor) -AppxMode 'sideload'
+    Assert-Equal 'sideload mainbundle exit' '1' "$($r.ExitCode)"
+    Assert-Contains 'sideload mainbundle accepted' 'kind=MainBundle' $r.Report
+    Assert-NotContains 'sideload mainbundle no rejection' 'descriptor rejected' $r.Output
+
+    $s = New-Sandbox 'sideload_both_kinds'
+    $descriptor = New-AppInstallerDescriptor $s -Kind Both
+    $r = Invoke-Sandbox $s @('check', '-AppInstallerFile', $descriptor) -AppxMode 'sideload'
+    Assert-Equal 'sideload both kinds exit' '2' "$($r.ExitCode)"
+    Assert-Contains 'sideload both kinds reason' 'both MainPackage and MainBundle' $r.Report
+
+    $s = New-Sandbox 'sideload_no_kind'
+    $descriptor = New-AppInstallerDescriptor $s -Kind None
+    $r = Invoke-Sandbox $s @('check', '-AppInstallerFile', $descriptor) -AppxMode 'sideload'
+    Assert-Equal 'sideload no kind exit' '2' "$($r.ExitCode)"
+    Assert-Contains 'sideload no kind reason' 'no supported MainPackage or MainBundle' $r.Report
+
     # 16. Descriptor validation failures are blocked.
     $s = New-Sandbox 'sideload_malformed'
     $bad = New-AppInstallerDescriptor $s -FileName 'bad.appinstaller'
@@ -553,10 +604,55 @@ try {
     Assert-Equal 'sideload update valid exit' '1' "$($r.ExitCode)"
     Assert-Contains 'sideload update used Add-AppxPackage' 'Add-AppxPackage' $r.Calls
     Assert-Contains 'sideload update not blocked' 'STATUS: PARTIAL' $r.Output
+    Assert-Contains 'sideload update package verification passed' 'Post-update package verification' $r.Report
+    Assert-Contains 'sideload update verified version' 'version=0.23.3' $r.Report
+
+    $s = New-Sandbox 'sideload_update_generic_fail'
+    $descriptor = New-AppInstallerDescriptor $s
+    $r = Invoke-Sandbox $s @('update', '-AppInstallerFile', $descriptor) -AppxMode 'sideload' -AppxFailMode 'generic'
+    Assert-Equal 'sideload generic failure exit' '1' "$($r.ExitCode)"
+    Assert-Contains 'sideload generic failure status' 'STATUS: FAILED' $r.Output
+    Assert-NotContains 'sideload generic failure not current' 'ALREADY_CURRENT' $r.Output
+    Assert-NotContains 'sideload generic failure not updated' 'STATUS: UPDATED' $r.Output
+
+    $s = New-Sandbox 'sideload_update_disappear'
+    $descriptor = New-AppInstallerDescriptor $s
+    $r = Invoke-Sandbox $s @('update', '-AppInstallerFile', $descriptor) -AppxMode 'sideload' -AppxDisappear '1'
+    Assert-Equal 'sideload disappearance exit' '1' "$($r.ExitCode)"
+    Assert-NotContains 'sideload disappearance not success' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'sideload disappearance reported' 'expected package version is missing' $r.Report
+
+    $s = New-Sandbox 'sideload_update_owner_change'
+    $descriptor = New-AppInstallerDescriptor $s
+    $r = Invoke-Sandbox $s @('update', '-AppInstallerFile', $descriptor) -AppxMode 'sideload' -AppxOwnerChange '1'
+    Assert-Equal 'sideload owner change exit' '1' "$($r.ExitCode)"
+    Assert-NotContains 'sideload owner change not success' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'sideload owner change reported' 'package ownership changed' $r.Report
+
+    $s = New-Sandbox 'sideload_update_downgrade'
+    $descriptor = New-AppInstallerDescriptor $s
+    $r = Invoke-Sandbox $s @('update', '-AppInstallerFile', $descriptor) -AppxMode 'sideload' -AppxUpdatedVersion '0.23.1'
+    Assert-Equal 'sideload downgrade observed exit' '1' "$($r.ExitCode)"
+    Assert-NotContains 'sideload downgrade observed not success' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'sideload downgrade observed reported' 'downgraded' $r.Report
+
+    $s = New-Sandbox 'sideload_update_insufficient'
+    $descriptor = New-AppInstallerDescriptor $s
+    $r = Invoke-Sandbox $s @('update', '-AppInstallerFile', $descriptor) -AppxMode 'sideload' -AppxUpdatedVersion '0.23.2'
+    Assert-Equal 'sideload insufficient exit' '1' "$($r.ExitCode)"
+    Assert-NotContains 'sideload insufficient not success' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'sideload insufficient reported' 'below validated descriptor target' $r.Report
+
+    $s = New-Sandbox 'sideload_update_invalid'
+    $descriptor = New-AppInstallerDescriptor $s
+    $r = Invoke-Sandbox $s @('update', '-AppInstallerFile', $descriptor) -AppxMode 'sideload' -AppxUpdatedVersion 'bad-version'
+    Assert-Equal 'sideload invalid version exit' '1' "$($r.ExitCode)"
+    Assert-NotContains 'sideload invalid version not success' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'sideload invalid version reported' 'not valid' $r.Report
 
     $s = New-Sandbox 'sideload_update_feed_fail'
     $descriptor = New-AppInstallerDescriptor $s
-    $r = Invoke-Sandbox $s @('update', '-AppInstallerFile', $descriptor) -AppxMode 'sideload' -AppxFail '1'
+    $r = Invoke-Sandbox $s @('update', '-AppInstallerFile', $descriptor) -AppxMode 'sideload' -AppxFailMode 'network'
     Assert-Equal 'sideload feed failure exit' '2' "$($r.ExitCode)"
     Assert-Contains 'sideload feed failure blocked' 'Official descriptor feed was unavailable' $r.Output
 

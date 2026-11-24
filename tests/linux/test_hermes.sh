@@ -176,6 +176,9 @@ case "${1:-}" in
         if [ -f "$fixtures/upstream_restarts_serve" ]; then
           echo $(( $(cat "$FAKE_SBX/pids/serve") + 100 )) >"$FAKE_SBX/pids/serve"
         fi
+        if [ -f "$fixtures/post_update_conflict" ]; then
+          echo "hermes-gateway.service enabled enabled" >"$fixtures/user_units.txt"
+        fi
         if [ -f "$fixtures/receipt_followup_after" ]; then
           write_followup="$fixtures/../home/.hermes/logs/update_receipts/update_$(date +%s%N).json"
           printf '%s\n' '{"schema":1,"outcome":"success","followups":[{"step":"gateway_restart","reason":"deferred backend restart"}],"gateway_restart":{"incomplete":true}}' >"$write_followup"
@@ -495,6 +498,21 @@ test_update_success() {
   assert_not_contains "update did not use --no-backup" "--no-backup" "$SBX/calls.log"
 }
 
+test_update_post_update_conflict_prevents_restarts() {
+  new_sandbox update_post_conflict
+  : >"$SBX/fixtures/post_update_conflict"
+  run_script "$SBX" update
+  assert_eq "post-update conflict exit" "1" "$(status_of "$SBX")"
+  assert_contains "post-update conflict not success" "STATUS: PARTIAL" "$SBX/stdout.txt"
+  assert_not_contains "post-update conflict not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  assert_eq "post-update conflict prevented gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
+  assert_eq "post-update conflict prevented backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "post-update conflict recorded" "deliberately prevented" "$report"
+  assert_eq "post-update conflict still one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+}
+
 test_update_respects_upstream_restart() {
   new_sandbox update_upstream_restart
   : >"$SBX/fixtures/upstream_restarts_serve"
@@ -692,6 +710,7 @@ test_update_blocked_dirty
 test_update_blocked_migration
 test_update_blocked_sudo
 test_update_success
+test_update_post_update_conflict_prevents_restarts
 test_update_respects_upstream_restart
 test_update_gateway_not_refreshed
 test_update_partial_receipt

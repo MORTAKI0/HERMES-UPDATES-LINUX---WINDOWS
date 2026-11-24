@@ -113,6 +113,16 @@ SERVE_UNIT_EXISTS="unknown"
 PRE_SERVE_ACTIVE="unknown"
 PRE_SERVE_PID="unknown"
 PRE_GATEWAY_PID="unknown"
+PRE_GATEWAY_UNIT=""
+PRE_GATEWAY_SCOPE=""
+PRE_GATEWAY_USER=""
+PRE_GATEWAY_EXEC=""
+PRE_SERVE_UNIT=""
+PRE_SERVE_SCOPE=""
+PRE_SERVE_USER=""
+PRE_SERVE_EXEC=""
+PRE_SERVE_UNIT_EXISTS="unknown"
+POST_UPDATE_SAFETY_BLOCK="no"
 BACKEND_RESTARTED="no"
 SERVE_REFRESHED="not applicable"
 LINGER="unknown"
@@ -1311,6 +1321,38 @@ update_preflight() {
   return 0
 }
 
+exec_signature() {
+  local exec="$1" path argv
+  path=$(printf '%s' "$exec" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
+  argv=$(printf '%s' "$exec" | sed -n 's/.*argv\[\]=\([^;]*\);.*/\1/p' | head -n 1)
+  printf '%s|%s' "$path" "$argv"
+}
+
+post_update_services_safe() {
+  if [ "$POST_UPDATE_SAFETY_BLOCK" = yes ]; then return 1; fi
+  local changed="" blocks
+  [ "$GATEWAY_UNIT" = "$PRE_GATEWAY_UNIT" ] || changed="${changed}gateway-unit,"
+  [ "$GATEWAY_SCOPE" = "$PRE_GATEWAY_SCOPE" ] || changed="${changed}gateway-scope,"
+  [ "$GATEWAY_USER" = "$PRE_GATEWAY_USER" ] || changed="${changed}gateway-owner,"
+  [ "$(exec_signature "$GATEWAY_EXEC")" = "$(exec_signature "$PRE_GATEWAY_EXEC")" ] || changed="${changed}gateway-exec,"
+  [ "$SERVE_UNIT_EXISTS" = "$PRE_SERVE_UNIT_EXISTS" ] || changed="${changed}backend-existence,"
+  [ "$SERVE_UNIT" = "$PRE_SERVE_UNIT" ] || changed="${changed}backend-unit,"
+  [ "$SERVE_SCOPE" = "$PRE_SERVE_SCOPE" ] || changed="${changed}backend-scope,"
+  [ "$SERVE_USER" = "$PRE_SERVE_USER" ] || changed="${changed}backend-owner,"
+  [ "$(exec_signature "$SERVE_EXEC")" = "$(exec_signature "$PRE_SERVE_EXEC")" ] || changed="${changed}backend-exec,"
+  blocks=$(count_lines "$BLOCKED_FILE")
+  if [ -n "$changed" ]; then
+    add_blocked PRECHECK "post-update service identity changed: ${changed%,}"
+  fi
+  if [ -n "$changed" ] || [ "$blocks" -gt 0 ]; then
+    POST_UPDATE_SAFETY_BLOCK="yes"
+    record_timeline "POST_UPDATE" "service safety recheck" "blocked" "ownership/topology changed; no further service restarts"
+    add_affected "Post-update ownership or topology ambiguity: manual gateway/backend restart deliberately prevented"
+    return 1
+  fi
+  return 0
+}
+
 gateway_live_revision_matches() {
   local installed_short live_rev
   installed_short=$(git -C "$CHECKOUT" rev-parse --short=8 HEAD 2>/dev/null || true)
@@ -1321,12 +1363,20 @@ gateway_live_revision_matches() {
 }
 
 refresh_gateway_if_needed() {
+  if ! post_update_services_safe; then
+    GATEWAY_REFRESHED="not attempted (post-update safety block)"
+    return 1
+  fi
   if [ "$GATEWAY_ACTIVE" = active ] && [ "$GATEWAY_PID" != "$PRE_GATEWAY_PID" ] && gateway_live_revision_matches; then
     GATEWAY_REFRESHED="by upstream updater"
     GATEWAY_REFRESH_DETAIL="gateway active, pid $PRE_GATEWAY_PID -> $GATEWAY_PID, live revision matches checkout"
     return 0
   fi
   if [ -z "$HERMES_BIN" ]; then return 1; fi
+  if ! post_update_services_safe; then
+    GATEWAY_REFRESHED="not attempted (post-update safety block)"
+    return 1
+  fi
   add_warning "Gateway did not demonstrate a refreshed PID and live revision; issuing one documented 'hermes gateway restart'"
   capture 300 "$HERMES_BIN" gateway restart
   local restart_exit="$RUN_STATUS"
@@ -1352,6 +1402,10 @@ refresh_backend_if_needed() {
     SERVE_REFRESHED="not applicable (no backend unit)"
     return 0
   fi
+  if ! post_update_services_safe; then
+    SERVE_REFRESHED="not attempted (post-update safety block)"
+    return 1
+  fi
   if [ "$PRE_SERVE_ACTIVE" != active ]; then
     SERVE_REFRESHED="not restarted (was not active before update)"
     return 0
@@ -1366,6 +1420,10 @@ refresh_backend_if_needed() {
   fi
   # Independently supervised backend was not refreshed (or is down): restart
   # only the preflight-verified existing unit, preserving its scope.
+  if ! post_update_services_safe; then
+    SERVE_REFRESHED="not attempted (post-update safety block)"
+    return 1
+  fi
   local -a cmd
   if [ "$SERVE_SCOPE" = system ]; then
     cmd=(sudo -n systemctl restart "$SERVE_UNIT")
@@ -1482,7 +1540,17 @@ decide_update() {
     add_degraded RECEIPT "native update receipt did not report a clean success"
   fi
 
-  if [ "$blocks" -gt 0 ]; then
+  if [ "$POST_UPDATE_SAFETY_BLOCK" = yes ]; then
+    local safety_reason
+    safety_reason=$(head -n 1 "$BLOCKED_FILE" | cut -d'|' -f2-)
+    if [ "$UPDATE_EXIT" != "not run" ] && [ "$UPDATE_EXIT" -ne 0 ]; then
+      STATUS="FAILED" ; EXIT_CODE=1
+    else
+      STATUS="PARTIAL" ; EXIT_CODE=1
+    fi
+    SUMMARY="Update ran, but post-update service safety recheck blocked further restarts: ${safety_reason:-ownership or topology changed}"
+    add_unknown "Manual gateway/backend restarts were deliberately prevented after post-update ownership or topology ambiguity"
+  elif [ "$blocks" -gt 0 ]; then
     STATUS="BLOCKED" ; EXIT_CODE=2
     SUMMARY=$(head -n 1 "$BLOCKED_FILE" | cut -d'|' -f2-)
   elif [ "$UPDATE_EXIT" != "not run" ] && [ "$UPDATE_EXIT" -ne 0 ]; then
@@ -1729,6 +1797,15 @@ main() {
   PRE_SERVE_ACTIVE="$SERVE_ACTIVE"
   PRE_SERVE_PID="$SERVE_PID"
   PRE_GATEWAY_PID="$GATEWAY_PID"
+  PRE_GATEWAY_UNIT="$GATEWAY_UNIT"
+  PRE_GATEWAY_SCOPE="$GATEWAY_SCOPE"
+  PRE_GATEWAY_USER="$GATEWAY_USER"
+  PRE_GATEWAY_EXEC="$GATEWAY_EXEC"
+  PRE_SERVE_UNIT="$SERVE_UNIT"
+  PRE_SERVE_SCOPE="$SERVE_SCOPE"
+  PRE_SERVE_USER="$SERVE_USER"
+  PRE_SERVE_EXEC="$SERVE_EXEC"
+  PRE_SERVE_UNIT_EXISTS="$SERVE_UNIT_EXISTS"
   if [ "$UPDATE_AVAILABLE" = no ]; then
     UPDATE_NEEDED="no"
     UPDATE_EXIT="not run"
@@ -1746,12 +1823,17 @@ main() {
   # Never restart services after a failed updater run: diagnose the code and
   # existing service state first, as required by the operations spec.
   if [ "$UPDATE_NEEDED" = yes ] && [ "$UPDATE_EXIT" = "0" ]; then
-    refresh_gateway_if_needed
-    refresh_backend_if_needed
-    # Re-probe HTTP only when the backend was restarted after collection.
-    if [ "$BACKEND_RESTARTED" = yes ]; then
-      probe_backend
-      recompute_profile_counts
+    if post_update_services_safe; then
+      refresh_gateway_if_needed
+      refresh_backend_if_needed
+      # Re-probe HTTP only when the backend was restarted after collection.
+      if [ "$BACKEND_RESTARTED" = yes ]; then
+        probe_backend
+        recompute_profile_counts
+      fi
+    else
+      GATEWAY_REFRESHED="not attempted (post-update safety block)"
+      SERVE_REFRESHED="not attempted (post-update safety block)"
     fi
   fi
   decide_update

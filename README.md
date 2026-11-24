@@ -144,8 +144,8 @@ receipt follow-ups, `latest.json` selection, user-scope units, wrong checkout
 binding, blocked update (dirty/migration/sudo), successful update (one updater
 call, backend PID refresh), upstream restart respect, stale gateway refresh,
 partial receipt, updater failure with no retry, already-current, argument
-rejection, provenance failures, unverified health states, and redaction.
-Current result: **93 assertions passed**.
+rejection, provenance failures, unverified health states, post-update restart
+safety, and redaction. Current result: **100 assertions passed**.
 
 Windows (must run on a Windows host):
 

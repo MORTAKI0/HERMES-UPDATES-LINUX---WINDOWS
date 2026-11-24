@@ -241,6 +241,7 @@ This **both sets the channel and performs the update**. Do **not** run a second 
 The updater automatically manages gateway services it recognizes, but **does not own an independently launched `hermes serve`**. After the code update, restart **only** the **preflight-verified existing** backend service using its actual supervisor and permissions (e.g. `systemctl --user restart hermes-serve.service`, or `sudo systemctl restart ...` only with separately approved privileges).
 
 - Preserve pre-update expected state: do **not** start a backend that was intentionally stopped, unless the operator explicitly requests it.
+- After post-update discovery, compare unit name, supervisor scope, unit account, and `ExecStart` with preflight evidence. If any service identity/topology changed or new blockers appeared, do **not** restart either service; report the update as `PARTIAL`/`BLOCKED` with restarts deliberately prevented.
 - Restart the gateway manually **only if** verification shows it did not restart correctly; use Hermes' documented `hermes gateway restart` or the verified supervisor. Do not blindly restart an already healthy gateway a second time.
 - Do not run migrations, reconfigure authentication, change `ExecStart`, expose a new bind address, restart unrelated services, or reboot the VM.
 - If upstream updater fails, **do not immediately run another updater**. Diagnose code state and existing service condition first. If the backend is stale but reachable, report partial state rather than claiming recovery.
@@ -349,7 +350,7 @@ Re-read `Get-AppxPackage` and the Store upgrade listing. Handle WinGet's `NO_APP
 
 ### C. Sideload MSIX Desktop
 
-1. Discover the actual registered App Installer source / official publisher feed. Verify **HTTPS host**, official sideload identity `NousResearch.HermesBundled`, publisher matching the installed Nous Research package, package version, non-downgrade, and Microsoft-trusted signature through Windows package validation. A missing descriptor is `UNKNOWN` in check mode and blocks update; a rejected descriptor is `BLOCKED`.
+1. Discover the actual registered App Installer source / official publisher feed. Accept a descriptor with exactly one official `MainPackage` or `MainBundle`; reject both/neither. Verify **HTTPS host**, official sideload identity `NousResearch.HermesBundled`, publisher matching the installed Nous Research package, package version, non-downgrade, and Microsoft-trusted signature through Windows package validation. A missing descriptor is `UNKNOWN` in check mode and blocks update; a rejected or ambiguous descriptor is `BLOCKED`.
 2. Only if the official signed `.appinstaller` descriptor is reachable and proposes a non-downgrade, use Windows `Add-AppxPackage -AppInstallerFile` through PowerShell.
 3. Validate installed package version afterward; if the publisher feed is unavailable, **BLOCKED**, with the failed URL/HTTP or transport error and no fallback source build.
 
@@ -358,6 +359,7 @@ Re-read `Get-AppxPackage` and the Store upgrade listing. Handle WinGet's `NO_APP
 ### Post-update Windows checks
 
 - Package/CLI version before/after and distributor-specific “current” status.
+- For Store/sideload updates, verify exactly one supported package remains installed with the expected identity, publisher, and ownership; the version must be valid, non-downgraded, advanced when required, and at least the validated sideload descriptor target. Missing, ambiguous, invalid, or unchanged packages are non-success.
 - When source-built, native Hermes diagnostics + latest receipt with no required follow-ups.
 - No unwanted Desktop GUI launch.
 - Remote URL host resolves and the VM HTTP endpoint responds with Hermes JSON.

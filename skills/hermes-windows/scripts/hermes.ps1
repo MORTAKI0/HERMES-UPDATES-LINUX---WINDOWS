@@ -128,6 +128,8 @@ $script:DesktopBuildState = 'unknown'
 $script:UpdateOutput = ''
 $script:UpdateExit = 'not run'
 $script:UpdateNeeded = $false
+$script:UpdateAttempted = $false
+$script:PostPackageVerified = 'not applicable'
 $script:DesktopRepairRun = 'no'
 $script:DesktopRepairResult = 'not applicable'
 
@@ -774,6 +776,7 @@ function Read-AppInstallerDescriptor {
         Valid = $false
         Reason = ''
         Path = $Path
+        Kind = ''
         Name = ''
         Version = ''
         Publisher = ''
@@ -800,10 +803,22 @@ function Read-AppInstallerDescriptor {
         $doc.Load($xmlReader)
         $xmlReader.Close()
         $stringReader.Close()
-        $main = $doc.SelectSingleNode('/*[local-name()="AppInstaller"]/*[local-name()="MainPackage"]')
-        if ($null -eq $main) {
-            $result.Reason = 'The .appinstaller file has no MainPackage element.'
+        $mainPackage = $doc.SelectSingleNode('/*[local-name()="AppInstaller"]/*[local-name()="MainPackage"]')
+        $mainBundle = $doc.SelectSingleNode('/*[local-name()="AppInstaller"]/*[local-name()="MainBundle"]')
+        if (($null -ne $mainPackage) -and ($null -ne $mainBundle)) {
+            $result.Reason = 'The .appinstaller file declares both MainPackage and MainBundle; ambiguous descriptor.'
             return $result
+        }
+        if (($null -eq $mainPackage) -and ($null -eq $mainBundle)) {
+            $result.Reason = 'The .appinstaller file has no supported MainPackage or MainBundle element.'
+            return $result
+        }
+        if ($null -ne $mainBundle) {
+            $main = $mainBundle
+            $result.Kind = 'MainBundle'
+        } else {
+            $main = $mainPackage
+            $result.Kind = 'MainPackage'
         }
         $result.Name = [string]$main.GetAttribute('Name')
         $result.Version = [string]$main.GetAttribute('Version')
@@ -892,9 +907,9 @@ function Get-SideloadDescriptorInfo {
         $script:UpdateAvailable = 'yes'
         $script:DistributorState = 'verified descriptor supplied'
     }
-    Add-Evidence "App Installer descriptor: path=$file identity=$($descriptor.Name) version=$($descriptor.Version) publisher=$($descriptor.Publisher) uri=$($descriptor.Uri)"
+    Add-Evidence "App Installer descriptor: path=$file kind=$($descriptor.Kind) identity=$($descriptor.Name) version=$($descriptor.Version) publisher=$($descriptor.Publisher) uri=$($descriptor.Uri)"
     Add-CheckRow 'Sideload update availability' 'verified official descriptor, non-downgrade' `
-        "identity=$($descriptor.Name) version=$($descriptor.Version); $($descriptor.Reason)" 'PASS'
+        "kind=$($descriptor.Kind) identity=$($descriptor.Name) version=$($descriptor.Version); $($descriptor.Reason)" 'PASS'
 }
 
 # ---------------------------------------------------------------------------
@@ -1170,11 +1185,12 @@ function Invoke-SourceUpdate {
 
     $updateArgs = @('update', '--set-channel', 'stable', '--yes')
     if ($NoBackup) { $updateArgs += '--no-backup' }
+    $script:UpdateAttempted = $true
+    $script:UpdateNeeded = $true
     Add-Timeline 'WINDOWS_PACKAGE' ("hermes " + ($updateArgs -join ' ')) 'started' 'single official updater invocation'
     $exit = Invoke-Native $script:HeremesPath $updateArgs
     $script:UpdateExit = $exit
     $script:UpdateOutput = $script:NativeOutput
-    $script:UpdateNeeded = $true
     $script:Mutations = 'hermes ' + ($updateArgs -join ' ')
     Add-Timeline 'WINDOWS_PACKAGE' ("hermes " + ($updateArgs -join ' ')) "exit $exit" (Limit-Text $script:UpdateOutput 8 600)
     Add-Evidence "Updater output (bounded): $(Limit-Text $script:UpdateOutput 20 1200)"
@@ -1206,11 +1222,12 @@ function Invoke-StoreUpdate {
     }
     $updateArgs = @('upgrade', '--id', $script:StoreProductId, '--exact', '--source', 'msstore',
               '--silent', '--accept-source-agreements', '--accept-package-agreements')
+    $script:UpdateAttempted = $true
+    $script:UpdateNeeded = $true
     Add-Timeline 'WINDOWS_PACKAGE' ("winget " + ($updateArgs -join ' ')) 'started' 'exact Store product ID'
     $exit = Invoke-Native 'winget' $updateArgs
     $script:UpdateExit = $exit
     $script:UpdateOutput = $script:NativeOutput
-    $script:UpdateNeeded = $true
     $script:Mutations = 'winget upgrade --id ' + $script:StoreProductId + ' --exact --source msstore'
     Add-Timeline 'WINDOWS_PACKAGE' ("winget " + ($updateArgs -join ' ')) "exit $exit" (Limit-Text $script:UpdateOutput 8 600)
     Add-Evidence "WinGet output (bounded): $(Limit-Text $script:UpdateOutput 20 1200)"
@@ -1218,6 +1235,7 @@ function Invoke-StoreUpdate {
     if ($script:UpdateOutput -match '(?i)no applicable upgrade|no newer package|already installed|no available upgrade') {
         $script:DistributorState = 'NO_APPLICABLE_UPGRADE'
         $script:UpdateNeeded = $false
+        $script:UpdateAttempted = $false
     }
     $newPackages = @(Get-AppxPackage -Name $script:StoreAppxName -ErrorAction SilentlyContinue)
     if ($newPackages.Count -eq 1) {
@@ -1251,11 +1269,12 @@ function Invoke-SideloadUpdate {
         Add-Block 'PRECHECK' "Sideload descriptor changed or became invalid: $($descriptor.Reason)"
         return
     }
+    $script:UpdateAttempted = $true
+    $script:UpdateNeeded = $true
     try {
         Add-Timeline 'WINDOWS_PACKAGE' 'Add-AppxPackage -AppInstallerFile' 'started' $file
         Add-AppxPackage -AppInstallerFile $file -ErrorAction Stop
         $script:UpdateExit = 0
-        $script:UpdateNeeded = $true
         $script:Mutations = 'Add-AppxPackage -AppInstallerFile ' + $file
         Add-Timeline 'WINDOWS_PACKAGE' 'Add-AppxPackage -AppInstallerFile' 'exit 0' "descriptor version $($descriptor.Version)"
     } catch {
@@ -1272,6 +1291,74 @@ function Invoke-SideloadUpdate {
         } else {
             Add-Degraded 'WINDOWS_PACKAGE' "Sideload package installation failed: $msg"
         }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# Post-update package verification
+# ---------------------------------------------------------------------------
+function Test-PostUpdatePackage {
+    if (-not $script:UpdateAttempted) {
+        $script:PostPackageVerified = 'not applicable'
+        return
+    }
+    if (($script:Owner -ne 'Microsoft Store') -and ($script:Owner -ne 'Sideload MSIX')) { return }
+    $problems = @()
+    if ($script:AppxIssue -ne '') {
+        Add-Block 'WINDOWS_PACKAGE' "Post-update package ownership is ambiguous or mismatched: $($script:AppxIssue)"
+        $script:PostPackageVerified = 'no'
+        Add-CheckRow 'Post-update package verification' 'exactly one supported package with expected ownership' $script:AppxIssue 'FAIL'
+        return
+    }
+    if ($script:AppxCount -ne 1) {
+        $problems += "expected exactly one supported package, observed $($script:AppxCount)."
+    } elseif ($script:AppxOwnerCandidate -ne $script:Owner) {
+        $problems += "package ownership changed to '$($script:AppxOwnerCandidate)' (expected '$($script:Owner)')."
+    }
+    $expectedName = $(if ($script:Owner -eq 'Microsoft Store') { $script:StoreAppxName } else { $script:BundledAppxName })
+    if (($null -ne $script:AppxPackage) -and ($script:AppxPackage.Name -ne $expectedName)) {
+        $problems += "installed package identity '$($script:AppxPackage.Name)' does not match expected '$expectedName'."
+    }
+
+    $afterText = [string]$script:InstalledVersionAfter
+    $after = $null
+    $before = $null
+    if ([string]::IsNullOrWhiteSpace($afterText) -or ($afterText -in @('absent', 'unknown', 'not applicable'))) {
+        $problems += "expected package version is missing or invalid ('$afterText')."
+    } elseif (-not [version]::TryParse($afterText, [ref]$after)) {
+        $problems += "installed version '$afterText' is not valid."
+    } else {
+        if ([version]::TryParse([string]$script:InstalledVersion, [ref]$before)) {
+            if ($after.CompareTo($before) -lt 0) {
+                $problems += "installed version $afterText downgraded from v$($script:InstalledVersion)."
+            } elseif ($after.CompareTo($before) -eq 0) {
+                $problems += "installed version did not advance from v$($script:InstalledVersion)."
+            }
+        }
+        if ($script:Owner -eq 'Sideload MSIX') {
+            $target = $null
+            if ([version]::TryParse([string]$script:SideloadDescriptorVersion, [ref]$target)) {
+                if ($after.CompareTo($target) -lt 0) {
+                    $problems += "installed version $afterText is below validated descriptor target $($script:SideloadDescriptorVersion)."
+                }
+            } else {
+                $problems += 'validated descriptor target version is unavailable.'
+            }
+        } elseif ($script:Owner -eq 'Microsoft Store') {
+            if ($script:DistributorState -eq 'NO_APPLICABLE_UPGRADE') {
+                $problems += 'Store distributor reported no applicable upgrade during an attempted update.'
+            }
+        }
+    }
+
+    if ($problems.Count -gt 0) {
+        $script:PostPackageVerified = 'no'
+        foreach ($problem in $problems) { Add-Degraded 'WINDOWS_PACKAGE' $problem }
+        Add-CheckRow 'Post-update package verification' 'expected package present, one owner, valid non-downgrade version' ($problems -join ' ') 'FAIL'
+    } else {
+        $script:PostPackageVerified = 'yes'
+        Add-CheckRow 'Post-update package verification' 'expected package present, one owner, valid non-downgrade version' `
+            "owner=$($script:AppxOwnerCandidate); version=$afterText" 'PASS'
     }
 }
 
@@ -1319,7 +1406,7 @@ function Set-UpdateVerdict {
         Add-Unknown 'No update was attempted after the blocker; the pre-existing package state remains.'
         return
     }
-    if ($script:UpdateNeeded) {
+    if ($script:UpdateAttempted) {
         if (($script:UpdateExit -ne 0) -and ($script:UpdateExit -ne 'not run') -and ($script:DistributorState -ne 'NO_APPLICABLE_UPGRADE')) {
             $problems++
             $updaterFailed = $true
@@ -1330,6 +1417,10 @@ function Set-UpdateVerdict {
                 $problems++
                 Add-Degraded 'WINDOWS_PACKAGE' "Installed version did not advance from v$($script:InstalledVersion) (after=$($script:InstalledVersionAfter))."
             }
+        }
+        if ((($script:Owner -eq 'Microsoft Store') -or ($script:Owner -eq 'Sideload MSIX')) -and ($script:PostPackageVerified -ne 'yes')) {
+            $problems++
+            Add-Degraded 'WINDOWS_PACKAGE' "Post-update package verification is '$($script:PostPackageVerified)', not verified success."
         }
         if ($script:Owner -eq 'Source build') {
             if ($script:ReceiptCheck -ne 'PASS') {
@@ -1362,7 +1453,7 @@ function Set-UpdateVerdict {
         $script:ExitCode = 1
         $script:Summary = "Owner-specific updater exited $($script:UpdateExit); no retry was attempted and verification is incomplete."
     } elseif ($problems -eq 0) {
-        if ($script:UpdateNeeded -and ($script:UpdateExit -ne 'not run')) {
+        if ($script:UpdateAttempted -and ($script:UpdateExit -ne 'not run')) {
             $script:Status = 'UPDATED'
         } else {
             $script:Status = 'ALREADY_CURRENT'
@@ -1706,6 +1797,7 @@ function Main {
         Get-SourceVersion -AfterUpdate
         Get-UpdateReceipt
     }
+    Test-PostUpdatePackage
     Test-BackendNetwork
     Invoke-StatusProbe
 
