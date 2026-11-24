@@ -122,7 +122,20 @@ PRE_SERVE_SCOPE=""
 PRE_SERVE_USER=""
 PRE_SERVE_EXEC=""
 PRE_SERVE_UNIT_EXISTS="unknown"
+PRE_CHECKOUT=""
+PRE_USER_SYSTEMD_AVAILABLE="unknown"
 POST_UPDATE_SAFETY_BLOCK="no"
+FRESH_SYS_UNITS=""
+FRESH_USER_UNITS=""
+FRESH_USER_AVAILABLE="no"
+FRESH_LIST_ERROR=""
+FRESH_UNIT=""
+FRESH_SCOPE=""
+FRESH_USER=""
+FRESH_EXEC=""
+FRESH_ACTIVE=""
+FRESH_PID=""
+FRESH_ERROR=""
 BACKEND_RESTARTED="no"
 SERVE_REFRESHED="not applicable"
 LINGER="unknown"
@@ -630,6 +643,7 @@ discover_migration_risk() {
 # systemd unit discovery ----------------------------------------------------
 SYS_UNITS=""
 USER_UNITS=""
+USER_SYSTEMD_AVAILABLE="unknown"
 
 systemctl_for() {
   local scope="$1" ; shift
@@ -648,8 +662,10 @@ unit_show() {
 discover_unit_lists() {
   SYS_UNITS=$(systemctl list-unit-files --no-legend 'hermes*' 2>/dev/null | awk '{print $1}')
   if systemctl --user list-unit-files --no-legend 'hermes*' >/dev/null 2>&1; then
+    USER_SYSTEMD_AVAILABLE="yes"
     USER_UNITS=$(systemctl --user list-unit-files --no-legend 'hermes*' 2>/dev/null | awk '{print $1}')
   else
+    USER_SYSTEMD_AVAILABLE="no"
     USER_UNITS=""
   fi
 }
@@ -1328,27 +1344,201 @@ exec_signature() {
   printf '%s|%s' "$path" "$argv"
 }
 
-post_update_services_safe() {
-  if [ "$POST_UPDATE_SAFETY_BLOCK" = yes ]; then return 1; fi
-  local changed="" blocks
-  [ "$GATEWAY_UNIT" = "$PRE_GATEWAY_UNIT" ] || changed="${changed}gateway-unit,"
-  [ "$GATEWAY_SCOPE" = "$PRE_GATEWAY_SCOPE" ] || changed="${changed}gateway-scope,"
-  [ "$GATEWAY_USER" = "$PRE_GATEWAY_USER" ] || changed="${changed}gateway-owner,"
-  [ "$(exec_signature "$GATEWAY_EXEC")" = "$(exec_signature "$PRE_GATEWAY_EXEC")" ] || changed="${changed}gateway-exec,"
-  [ "$SERVE_UNIT_EXISTS" = "$PRE_SERVE_UNIT_EXISTS" ] || changed="${changed}backend-existence,"
-  [ "$SERVE_UNIT" = "$PRE_SERVE_UNIT" ] || changed="${changed}backend-unit,"
-  [ "$SERVE_SCOPE" = "$PRE_SERVE_SCOPE" ] || changed="${changed}backend-scope,"
-  [ "$SERVE_USER" = "$PRE_SERVE_USER" ] || changed="${changed}backend-owner,"
-  [ "$(exec_signature "$SERVE_EXEC")" = "$(exec_signature "$PRE_SERVE_EXEC")" ] || changed="${changed}backend-exec,"
-  blocks=$(count_lines "$BLOCKED_FILE")
-  if [ -n "$changed" ]; then
-    add_blocked PRECHECK "post-update service identity changed: ${changed%,}"
-  fi
-  if [ -n "$changed" ] || [ "$blocks" -gt 0 ]; then
-    POST_UPDATE_SAFETY_BLOCK="yes"
-    record_timeline "POST_UPDATE" "service safety recheck" "blocked" "ownership/topology changed; no further service restarts"
-    add_affected "Post-update ownership or topology ambiguity: manual gateway/backend restart deliberately prevented"
+fresh_unit_lists() {
+  FRESH_SYS_UNITS=""
+  FRESH_USER_UNITS=""
+  FRESH_USER_AVAILABLE="no"
+  FRESH_LIST_ERROR=""
+  local out user_out
+  if ! out=$(systemctl list-unit-files --no-legend 'hermes*' 2>/dev/null); then
+    FRESH_LIST_ERROR="system-scope systemd discovery failed"
     return 1
+  fi
+  FRESH_SYS_UNITS=$(printf '%s\n' "$out" | awk '{print $1}')
+  if systemctl --user list-unit-files --no-legend 'hermes*' >/dev/null 2>&1; then
+    FRESH_USER_AVAILABLE="yes"
+    if ! user_out=$(systemctl --user list-unit-files --no-legend 'hermes*' 2>/dev/null); then
+      FRESH_LIST_ERROR="user-scope systemd discovery failed"
+      return 1
+    fi
+    FRESH_USER_UNITS=$(printf '%s\n' "$user_out" | awk '{print $1}')
+  else
+    FRESH_USER_AVAILABLE="no"
+  fi
+  if [ "$PRE_USER_SYSTEMD_AVAILABLE" = yes ] && [ "$FRESH_USER_AVAILABLE" != yes ]; then
+    FRESH_LIST_ERROR="user-scope systemd discovery became unavailable"
+    return 1
+  fi
+  return 0
+}
+
+fresh_find_role() {
+  local role="$1" exact="$2" match_role="$3"
+  local sys_exact="" user_exact="" sys_all="" user_all="" u desc exec count rc
+  FRESH_UNIT=""
+  FRESH_SCOPE=""
+  FRESH_USER=""
+  FRESH_EXEC=""
+  FRESH_ACTIVE=""
+  FRESH_PID=""
+  FRESH_ERROR=""
+  if printf '%s\n' "$FRESH_SYS_UNITS" | grep -Fxq "$exact"; then sys_exact="$exact"; fi
+  if printf '%s\n' "$FRESH_USER_UNITS" | grep -Fxq "$exact"; then user_exact="$exact"; fi
+  if [ -z "$sys_exact" ]; then
+    for u in $FRESH_SYS_UNITS; do
+      [ -n "$u" ] || continue
+      desc=$(unit_show system "$u" Description)
+      exec=$(unit_show system "$u" ExecStart)
+      if role_matches "$match_role" "$u" "$desc" "$exec"; then sys_all="${sys_all}${sys_all:+,}$u"; fi
+    done
+    count=$(printf '%s' "$sys_all" | awk -F, 'NF && $0!="" {print NF}')
+    [ -n "$count" ] || count=0
+    if [ "$count" -gt 1 ]; then
+      FRESH_ERROR="multiple $role candidates in system scope: $sys_all"
+      return 1
+    fi
+    [ "$count" -eq 1 ] && sys_exact="$sys_all"
+  fi
+  if [ -z "$user_exact" ]; then
+    for u in $FRESH_USER_UNITS; do
+      [ -n "$u" ] || continue
+      desc=$(unit_show user "$u" Description)
+      exec=$(unit_show user "$u" ExecStart)
+      if role_matches "$match_role" "$u" "$desc" "$exec"; then user_all="${user_all}${user_all:+,}$u"; fi
+    done
+    count=$(printf '%s' "$user_all" | awk -F, 'NF && $0!="" {print NF}')
+    [ -n "$count" ] || count=0
+    if [ "$count" -gt 1 ]; then
+      FRESH_ERROR="multiple $role candidates in user scope: $user_all"
+      return 1
+    fi
+    [ "$count" -eq 1 ] && user_exact="$user_all"
+  fi
+  if [ -n "$sys_exact" ] && [ -n "$user_exact" ]; then
+    FRESH_ERROR="$role exists in both system ('$sys_exact') and user ('$user_exact') scopes"
+    return 1
+  fi
+  if [ -n "$sys_exact" ]; then
+    FRESH_UNIT="$sys_exact"
+    FRESH_SCOPE="system"
+  elif [ -n "$user_exact" ]; then
+    FRESH_UNIT="$user_exact"
+    FRESH_SCOPE="user"
+  else
+    FRESH_ERROR="no $role unit discovered"
+    return 2
+  fi
+  FRESH_ACTIVE=$(unit_show "$FRESH_SCOPE" "$FRESH_UNIT" ActiveState)
+  FRESH_PID=$(unit_show "$FRESH_SCOPE" "$FRESH_UNIT" MainPID)
+  FRESH_USER=$(unit_show "$FRESH_SCOPE" "$FRESH_UNIT" User)
+  FRESH_EXEC=$(unit_show "$FRESH_SCOPE" "$FRESH_UNIT" ExecStart)
+  if [ "$FRESH_SCOPE" = user ] && [ -z "$FRESH_USER" ]; then FRESH_USER="$EFFECTIVE_USER"; fi
+  [ -n "$FRESH_USER" ] || FRESH_USER="root (systemd default)"
+  if [ -z "$FRESH_ACTIVE" ] || [ -z "$FRESH_EXEC" ]; then
+    FRESH_ERROR="service state or ExecStart is unavailable for $FRESH_UNIT"
+    return 1
+  fi
+  if [ "$FRESH_ACTIVE" = active ] && { [ -z "$FRESH_PID" ] || [ "$FRESH_PID" = "0" ]; }; then
+    FRESH_ERROR="active service MainPID is unavailable for $FRESH_UNIT"
+    return 1
+  fi
+  return 0
+}
+
+exec_belongs_to_checkout() {
+  local exec="$1" path resolved
+  [ -n "$PRE_CHECKOUT" ] || return 1
+  path=$(printf '%s' "$exec" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
+  [ -n "$path" ] || return 1
+  resolved=$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")
+  case "$resolved" in "$PRE_CHECKOUT"/*) return 0 ;; esac
+  if [ -f "$path" ] && head -n 30 "$path" 2>/dev/null | grep -Fq "$PRE_CHECKOUT"; then
+    return 0
+  fi
+  return 1
+}
+
+mark_post_update_safety_block() {
+  local role="$1" reason="$2"
+  if [ "$POST_UPDATE_SAFETY_BLOCK" = yes ]; then return 0; fi
+  if [ -n "$reason" ]; then
+    add_blocked PRECHECK "post-update service safety check blocked restart: $reason"
+  fi
+  POST_UPDATE_SAFETY_BLOCK="yes"
+  record_timeline "POST_UPDATE" "fresh $role service discovery" "blocked" "$reason"
+  add_affected "Post-update $role safety block: further manual service restart(s) were deliberately prevented ($reason)"
+}
+
+post_update_services_safe() {
+  local role="$1" exact="$2" match_role="$3" base_unit base_scope base_user base_exec changed="" blocks rc
+  if [ "$POST_UPDATE_SAFETY_BLOCK" = yes ]; then return 1; fi
+  blocks=$(count_lines "$BLOCKED_FILE")
+  if [ "$blocks" -gt 0 ]; then
+    mark_post_update_safety_block "$role" "existing post-update safety blocker"
+    return 1
+  fi
+  if ! fresh_unit_lists; then
+    mark_post_update_safety_block "$role" "$FRESH_LIST_ERROR"
+    return 1
+  fi
+  fresh_find_role "$role" "$exact" "$match_role"
+  rc=$?
+  if [ "$rc" -ne 0 ]; then
+    if [ "$rc" -eq 2 ] && [ "$role" = backend ] && [ "$PRE_SERVE_UNIT_EXISTS" != yes ]; then
+      SERVE_UNIT_EXISTS="no"
+      SERVE_UNIT=""
+      SERVE_SCOPE=""
+      SERVE_USER=""
+      SERVE_EXEC=""
+      SERVE_ACTIVE="unknown"
+      SERVE_PID="unknown"
+      return 0
+    fi
+    mark_post_update_safety_block "$role" "$FRESH_ERROR"
+    return 1
+  fi
+  if [ "$role" = gateway ]; then
+    base_unit="$PRE_GATEWAY_UNIT"
+    base_scope="$PRE_GATEWAY_SCOPE"
+    base_user="$PRE_GATEWAY_USER"
+    base_exec="$PRE_GATEWAY_EXEC"
+  else
+    if [ "$PRE_SERVE_UNIT_EXISTS" != yes ]; then
+      mark_post_update_safety_block "$role" "backend was not present in the immutable preflight baseline"
+      return 1
+    fi
+    base_unit="$PRE_SERVE_UNIT"
+    base_scope="$PRE_SERVE_SCOPE"
+    base_user="$PRE_SERVE_USER"
+    base_exec="$PRE_SERVE_EXEC"
+  fi
+  [ -n "$base_unit" ] || changed="${changed}baseline-unit,"
+  [ "$FRESH_UNIT" = "$base_unit" ] || changed="${changed}unit,"
+  [ "$FRESH_SCOPE" = "$base_scope" ] || changed="${changed}supervisor-scope,"
+  [ "$FRESH_USER" = "$base_user" ] || changed="${changed}execution-account,"
+  [ "$(exec_signature "$FRESH_EXEC")" = "$(exec_signature "$base_exec")" ] || changed="${changed}exec-start,"
+  exec_belongs_to_checkout "$FRESH_EXEC" || changed="${changed}checkout-binding,"
+  if [ -n "$changed" ]; then
+    mark_post_update_safety_block "$role" "$role identity changed: ${changed%,}"
+    return 1
+  fi
+  # Fresh evidence is now the current evidence for the restart decision; the
+  # PRE_* baseline above remains immutable.
+  if [ "$role" = gateway ]; then
+    GATEWAY_UNIT="$FRESH_UNIT"
+    GATEWAY_SCOPE="$FRESH_SCOPE"
+    GATEWAY_USER="$FRESH_USER"
+    GATEWAY_EXEC="$FRESH_EXEC"
+    GATEWAY_ACTIVE="$FRESH_ACTIVE"
+    GATEWAY_PID="$FRESH_PID"
+  else
+    SERVE_UNIT_EXISTS="yes"
+    SERVE_UNIT="$FRESH_UNIT"
+    SERVE_SCOPE="$FRESH_SCOPE"
+    SERVE_USER="$FRESH_USER"
+    SERVE_EXEC="$FRESH_EXEC"
+    SERVE_ACTIVE="$FRESH_ACTIVE"
+    SERVE_PID="$FRESH_PID"
   fi
   return 0
 }
@@ -1363,7 +1553,7 @@ gateway_live_revision_matches() {
 }
 
 refresh_gateway_if_needed() {
-  if ! post_update_services_safe; then
+  if ! post_update_services_safe gateway "hermes-gateway.service" gateway; then
     GATEWAY_REFRESHED="not attempted (post-update safety block)"
     return 1
   fi
@@ -1373,7 +1563,7 @@ refresh_gateway_if_needed() {
     return 0
   fi
   if [ -z "$HERMES_BIN" ]; then return 1; fi
-  if ! post_update_services_safe; then
+  if ! post_update_services_safe gateway "hermes-gateway.service" gateway; then
     GATEWAY_REFRESHED="not attempted (post-update safety block)"
     return 1
   fi
@@ -1398,13 +1588,13 @@ refresh_gateway_if_needed() {
 }
 
 refresh_backend_if_needed() {
+  if ! post_update_services_safe backend "hermes-serve.service" serve; then
+    SERVE_REFRESHED="not attempted (post-update safety block)"
+    return 1
+  fi
   if [ "$SERVE_UNIT_EXISTS" != yes ]; then
     SERVE_REFRESHED="not applicable (no backend unit)"
     return 0
-  fi
-  if ! post_update_services_safe; then
-    SERVE_REFRESHED="not attempted (post-update safety block)"
-    return 1
   fi
   if [ "$PRE_SERVE_ACTIVE" != active ]; then
     SERVE_REFRESHED="not restarted (was not active before update)"
@@ -1420,7 +1610,7 @@ refresh_backend_if_needed() {
   fi
   # Independently supervised backend was not refreshed (or is down): restart
   # only the preflight-verified existing unit, preserving its scope.
-  if ! post_update_services_safe; then
+  if ! post_update_services_safe backend "hermes-serve.service" serve; then
     SERVE_REFRESHED="not attempted (post-update safety block)"
     return 1
   fi
@@ -1806,6 +1996,8 @@ main() {
   PRE_SERVE_USER="$SERVE_USER"
   PRE_SERVE_EXEC="$SERVE_EXEC"
   PRE_SERVE_UNIT_EXISTS="$SERVE_UNIT_EXISTS"
+  PRE_CHECKOUT="$CHECKOUT"
+  PRE_USER_SYSTEMD_AVAILABLE="$USER_SYSTEMD_AVAILABLE"
   if [ "$UPDATE_AVAILABLE" = no ]; then
     UPDATE_NEEDED="no"
     UPDATE_EXIT="not run"
@@ -1823,17 +2015,12 @@ main() {
   # Never restart services after a failed updater run: diagnose the code and
   # existing service state first, as required by the operations spec.
   if [ "$UPDATE_NEEDED" = yes ] && [ "$UPDATE_EXIT" = "0" ]; then
-    if post_update_services_safe; then
-      refresh_gateway_if_needed
-      refresh_backend_if_needed
-      # Re-probe HTTP only when the backend was restarted after collection.
-      if [ "$BACKEND_RESTARTED" = yes ]; then
-        probe_backend
-        recompute_profile_counts
-      fi
-    else
-      GATEWAY_REFRESHED="not attempted (post-update safety block)"
-      SERVE_REFRESHED="not attempted (post-update safety block)"
+    refresh_gateway_if_needed
+    refresh_backend_if_needed
+    # Re-probe HTTP only when the backend was restarted after collection.
+    if [ "$BACKEND_RESTARTED" = yes ]; then
+      probe_backend
+      recompute_profile_counts
     fi
   fi
   decide_update

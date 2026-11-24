@@ -101,10 +101,15 @@ Preflight (all read-only), then at most one controlled mutation sequence:
 3. Re-reads version, plan, gateway, profiles, backend PID/service and receipt
    independently. It does not trust the updater's exit code.
 4. Restarts the gateway manually only if the verified live revision/PID did not
-   refresh; otherwise it respects the upstream restart.
+   refresh; otherwise it respects the upstream restart. Immediately before that
+   restart it re-runs read-only discovery and blocks on any change or
+   incomplete evidence.
 5. Restarts **only the preflight-verified existing** independently supervised
    backend, and only when the upstream updater did not. A backend that was
-   stopped before the update stays stopped.
+   stopped before the update stays stopped. Discovery is refreshed again
+   immediately before the backend restart and compared with the immutable
+   preflight baseline; changes or missing evidence prevent all further manual
+   restarts.
 6. Verifies the backend PID changed, `/api/status` returns Hermes JSON, every
    expected profile is served, and the fresh receipt has no required
    follow-ups. A healthy gateway with a stale/dead backend is `PARTIAL`.
