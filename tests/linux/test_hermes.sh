@@ -795,6 +795,53 @@ test_update_blocked_in_hermes_cgroup() {
   assert_eq "unsafe context no restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
 }
 
+test_update_custom_gateway_cgroup_blocks() {
+  new_sandbox update_custom_cgroup
+  cat >"$SBX/fixtures/sys_units.txt" <<'EOF'
+custom-gateway.service enabled enabled
+hermes-serve.service enabled enabled
+EOF
+  local fake="$SBX/fakeproc"
+  mkdir -p "$fake"
+  env PATH="$SBX/bin:/usr/bin:/bin" HOME="$SBX/home" \
+      HERMES_HOME="$SBX/home/.hermes" HERMES_OPS_REPORT_DIR="$SBX/reports" \
+      FAKE_SBX="$SBX" FAKE_CHECKOUT="$SBX/checkout" FAKE_PROC="$fake" SCRIPT_PATH="$SCRIPT" \
+      bash -c '
+        pid=$$; mkdir -p "$FAKE_PROC/$pid"
+        printf "Name:\tbash\nPPid:\t%s\n" "$PPID" >"$FAKE_PROC/$pid/status"
+        printf "0::/system.slice/custom-gateway.service\n" >"$FAKE_PROC/$pid/cgroup"
+        exec env HERMES_OPS_PROC_ROOT="$FAKE_PROC" PATH="$PATH" HOME="$HOME" \
+          HERMES_HOME="$HERMES_HOME" HERMES_OPS_REPORT_DIR="$HERMES_OPS_REPORT_DIR" \
+          FAKE_SBX="$FAKE_SBX" FAKE_CHECKOUT="$FAKE_CHECKOUT" bash "$SCRIPT_PATH" update
+      ' >"$SBX/stdout.txt" 2>"$SBX/stderr.txt"
+  echo $? >"$SBX/status.txt"
+  assert_eq "custom cgroup exit" "2" "$(status_of "$SBX")"
+  assert_contains "custom cgroup blocked" "STATUS: BLOCKED" "$SBX/stdout.txt"
+  assert_eq "custom cgroup no update" "0" "$(count_matches 'update --yes' "$SBX/calls.log")"
+}
+
+test_update_similar_unrelated_cgroup_allowed() {
+  new_sandbox update_similar_cgroup
+  local fake="$SBX/fakeproc"
+  mkdir -p "$fake"
+  env PATH="$SBX/bin:/usr/bin:/bin" HOME="$SBX/home" \
+      HERMES_HOME="$SBX/home/.hermes" HERMES_OPS_REPORT_DIR="$SBX/reports" \
+      FAKE_SBX="$SBX" FAKE_CHECKOUT="$SBX/checkout" FAKE_PROC="$fake" SCRIPT_PATH="$SCRIPT" \
+      bash -c '
+        pid=$$; mkdir -p "$FAKE_PROC/$pid" "$FAKE_PROC/1"
+        printf "Name:\tbash\nPPid:\t1\n" >"$FAKE_PROC/$pid/status"
+        printf "0::/system.slice/not-hermes-gateway.service\n" >"$FAKE_PROC/$pid/cgroup"
+        printf "Name:\tinit\nPPid:\t0\n" >"$FAKE_PROC/1/status"
+        printf "0::/init.scope\n" >"$FAKE_PROC/1/cgroup"
+        exec env HERMES_OPS_PROC_ROOT="$FAKE_PROC" PATH="$PATH" HOME="$HOME" \
+          HERMES_HOME="$HERMES_HOME" HERMES_OPS_REPORT_DIR="$HERMES_OPS_REPORT_DIR" \
+          FAKE_SBX="$FAKE_SBX" FAKE_CHECKOUT="$FAKE_CHECKOUT" bash "$SCRIPT_PATH" update
+      ' >"$SBX/stdout.txt" 2>"$SBX/stderr.txt"
+  echo $? >"$SBX/status.txt"
+  assert_eq "similar cgroup allowed update" "1" "$(count_matches 'update --yes' "$SBX/calls.log")"
+  assert_not_contains "similar cgroup not blocked for cgroup" "inside the gateway service cgroup" "$SBX/stdout.txt"
+}
+
 test_update_post_update_conflict_prevents_restarts() {
   new_sandbox update_post_conflict
   : >"$SBX/fixtures/post_update_conflict"
@@ -1016,6 +1063,8 @@ test_update_advanced_wrong_revision_fails
 test_update_correlated_receipt_survives_unrelated_latest
 test_update_backend_address_changed_fails
 test_update_blocked_in_hermes_cgroup
+test_update_custom_gateway_cgroup_blocks
+test_update_similar_unrelated_cgroup_allowed
 test_update_post_update_conflict_prevents_restarts
 test_update_respects_upstream_restart
 test_update_partial_receipt
