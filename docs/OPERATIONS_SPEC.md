@@ -231,18 +231,19 @@ Stop **before any mutation** when:
 For a validated official source install, the primary command is:
 
 ```bash
-hermes update --set-channel stable --yes
+hermes update --yes
 ```
 
 This **both sets the channel and performs the update**. Do **not** run a second `hermes update`. Add `--no-backup` only if explicitly requested; otherwise keep Hermes' built-in quick snapshot. The upstream updater handles its own dependency preparation, gateway pause/restart, startup syntax guard, receipts, and internal rollback logic. Do not run `git pull`, `pip install`, `npm install`, or an external installer as a parallel or fallback update.
 
-### Refresh the separately managed Desktop backend
+### Service lifecycle and backend readiness
 
-The updater automatically manages gateway services it recognizes, but **does not own an independently launched `hermes serve`**. After the code update, restart **only** the **preflight-verified existing** backend service using its actual supervisor and permissions (e.g. `systemctl --user restart hermes-serve.service`, or `sudo systemctl restart ...` only with separately approved privileges).
+The updater owns gateway and backend lifecycle. The wrapper performs **no** automatic service restart, `systemctl restart`, or `hermes gateway restart`. After the update it verifies the installed release, Git revision, gateway state, expected/served profiles, native receipt, and backend readiness.
 
-- Preserve pre-update expected state: do **not** start a backend that was intentionally stopped, unless the operator explicitly requests it.
-- Immediately before **each** manual gateway or backend restart, perform fresh read-only service discovery. Verify the unit still exists unambiguously and that its name, supervisor scope, unit account, `ExecStart`, and checkout binding match the **immutable** preflight baseline. If discovery fails, evidence is incomplete, or any safety-critical value changed or new blockers appeared, do **not** perform any further manual restart. Report the update as `PARTIAL` (exit 1) with the exact mutations already made and the restarts deliberately prevented.
-- Restart the gateway manually **only if** verification shows it did not restart correctly; use Hermes' documented `hermes gateway restart` or the verified supervisor. Do not blindly restart an already healthy gateway a second time.
+- Hermes must have verified the channel is `stable` before the update command is issued.
+- The wrapper polls the backend `/api/status` endpoint with a bounded number of attempts and records whether it became ready.
+- A backend that was stopped before the update is not started by the wrapper.
+- Profile inventory uses registered profiles from `hermes profile list`; deleted profiles are excluded even if stale directories remain.
 - Do not run migrations, reconfigure authentication, change `ExecStart`, expose a new bind address, restart unrelated services, or reboot the VM.
 - If upstream updater fails, **do not immediately run another updater**. Diagnose code state and existing service condition first. If the backend is stale but reachable, report partial state rather than claiming recovery.
 
@@ -289,7 +290,7 @@ executable.
 
 | Detection | Correct owner | Allowed update |
 |---|---|---|
-| Verified source-built Desktop, no competing package ambiguity | Hermes CLI | `hermes update --set-channel stable --yes` |
+| Verified source-built Desktop, no competing package ambiguity | Hermes CLI | `hermes update --yes` |
 | Verified Microsoft Store app | Microsoft Store | `winget upgrade --id 9PMXK8CZC7KR --exact --source msstore ...` |
 | Verified signed sideload MSIX/App Installer | Registered Windows App Installer feed | `Add-AppxPackage -AppInstallerFile <verified official descriptor>` |
 | Both Store/MSIX and source build exist, active Desktop owner unclear | Unknown | **BLOCKED** |
@@ -327,7 +328,7 @@ executable.
 
 ```powershell
 hermes update --plan
-hermes update --set-channel stable --yes
+hermes update --yes
 ```
 
 Add `--no-backup` only if explicitly selected. Check `$LASTEXITCODE` after **every** external command. The source updater can rebuild Desktop as part of its own pipeline. Use the terminal-only repair:
@@ -486,8 +487,8 @@ All values in this example are **hypothetical**. Reports must always use actual 
 - [ ] `bash -n` passes; behavior tested with mocked `hermes`, `systemctl`, `curl` and a temporary fake receipt.
 - [ ] `check` does not call update/apply, service restart, migration apply or config setter.
 - [ ] Fails closed on wrong UNIX user, missing source, conflicting user/system units, dirty checkout, older stable target, migration plan requiring consent.
-- [ ] Uses `hermes update --set-channel stable --yes` only once, no unrequested `--no-backup`.
-- [ ] Native gateway restart respected; separately supervised `hermes-serve` refreshed and PID verified when applicable.
+- [ ] Uses `hermes update --yes` only once, after verifying the stable channel, no unrequested `--no-backup`.
+- [ ] Verifies installed release, Git revision, expected/served profiles, backend readiness, and native receipt follow-ups.
 - [ ] Receipt with `outcome=success` **and a followup** produces `PARTIAL`, not `UPDATED`.
 - [ ] HTTP 200 wrong content is not a success; HTTP 401 is not an authenticated session success.
 - [ ] Relevant service failure includes redacted journal evidence and exact remediation guidance.

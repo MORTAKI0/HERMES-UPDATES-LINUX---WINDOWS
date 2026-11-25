@@ -58,6 +58,9 @@ new_sandbox() {
   git -C "$SBX/checkout" commit -q -m "initial"
   git -C "$SBX/checkout" remote add origin https://github.com/NousResearch/hermes-agent.git
   git -C "$SBX/checkout" checkout -q --detach HEAD
+  git -C "$SBX/checkout" commit --allow-empty -q -m "updated"
+  git -C "$SBX/checkout" rev-parse --short=8 HEAD >"$SBX/target-sha"
+  git -C "$SBX/checkout" checkout -q --detach HEAD~1
 
   # Fixtures.
   cat >"$SBX/fixtures/version.txt" <<EOF
@@ -167,8 +170,12 @@ case "${1:-}" in
           printf '    • dashboard [default] pid %s — systemd\n' "$(cat "$FAKE_SBX/pids/serve")"
           echo "      restart: systemctl restart (drain-first SIGUSR1 when supported)"
         } ;;
-      --set-channel)
+      --yes)
         if [ -f "$fixtures/update_fail" ]; then echo "simulated updater failure"; exit 1; fi
+        if [ -f "$fixtures/update_no_install" ]; then echo "no code installed"; exit 0; fi
+        if [ ! -f "$fixtures/wrong_revision" ]; then
+          git -C "$FAKE_CHECKOUT" checkout -q --detach "$(cat "$FAKE_SBX/target-sha")"
+        fi
         cp "$fixtures/version_after.txt" "$fixtures/version.txt"
         if [ ! -f "$fixtures/no_upstream_gateway_restart" ]; then
           echo $(( $(cat "$FAKE_SBX/pids/gateway") + 100 )) >"$FAKE_SBX/pids/gateway"
@@ -179,11 +186,14 @@ case "${1:-}" in
         if [ -f "$fixtures/post_update_conflict" ]; then
           echo "hermes-gateway.service enabled enabled" >"$fixtures/user_units.txt"
         fi
+        if [ -f "$fixtures/receipt_missing_after" ]; then
+          echo "simulated missing receipt"; exit 0
+        fi
         if [ -f "$fixtures/receipt_followup_after" ]; then
           write_followup="$fixtures/../home/.hermes/logs/update_receipts/update_$(date +%s%N).json"
-          printf '%s\n' '{"schema":1,"outcome":"success","followups":[{"step":"gateway_restart","reason":"deferred backend restart"}],"gateway_restart":{"incomplete":true}}' >"$write_followup"
+          printf '{"correlation_id":"%s","outcome":"success","followups":[{"step":"gateway_restart","reason":"deferred backend restart"}],"gateway_restart":{"incomplete":true}}\n' "${HERMES_UPDATE_CORRELATION_ID:-}" >"$write_followup"
         else
-          printf '%s\n' '{"schema":1,"outcome":"success","followups":[],"gateway_restart":{"incomplete":false},"desktop":{"status":"ok"}}' >"$FAKE_SBX/home/.hermes/logs/update_receipts/update_$(date +%s%N).json"
+          printf '{"correlation_id":"%s","outcome":"success","followups":[],"gateway_restart":{"incomplete":false},"desktop":{"status":"ok"}}\n' "${HERMES_UPDATE_CORRELATION_ID:-}" >"$FAKE_SBX/home/.hermes/logs/update_receipts/update_$(date +%s%N).json"
         fi
         echo "simulated successful update" ;;
       *) echo "unsupported update args: $*" >&2; exit 9 ;;
@@ -518,7 +528,7 @@ test_update_blocked_dirty() {
   run_script "$SBX" update
   assert_eq "update dirty exit" "2" "$(status_of "$SBX")"
   assert_contains "update dirty verdict" "STATUS: BLOCKED" "$SBX/stdout.txt"
-  assert_eq "update dirty made no update call" "0" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+  assert_eq "update dirty made no update call" "0" "$(count_matches 'update --yes' "$SBX/calls.log")"
 }
 
 test_update_blocked_migration() {
@@ -527,7 +537,7 @@ test_update_blocked_migration() {
   run_script "$SBX" update
   assert_eq "update migration exit" "2" "$(status_of "$SBX")"
   assert_contains "update migration reason" "topology change" "$SBX/stdout.txt"
-  assert_eq "update migration made no update call" "0" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+  assert_eq "update migration made no update call" "0" "$(count_matches 'update --yes' "$SBX/calls.log")"
 }
 
 test_update_blocked_sudo() {
@@ -536,7 +546,7 @@ test_update_blocked_sudo() {
   run_script "$SBX" update
   assert_eq "update no sudo exit" "2" "$(status_of "$SBX")"
   assert_contains "update no sudo reason" "passwordless sudo" "$SBX/stdout.txt"
-  assert_eq "update no sudo made no update call" "0" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+  assert_eq "update no sudo made no update call" "0" "$(count_matches 'update --yes' "$SBX/calls.log")"
 }
 
 test_update_success() {
@@ -544,150 +554,34 @@ test_update_success() {
   run_script "$SBX" update
   assert_eq "update success exit" "0" "$(status_of "$SBX")"
   assert_contains "update success verdict" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "exactly one native update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
-  assert_eq "backend restarted exactly once" "1" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
+  assert_eq "exactly one native update" "1" "$(count_matches 'update --yes' "$SBX/calls.log")"
+  assert_eq "wrapper performed no service restarts" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
+  assert_eq "wrapper performed no gateway restarts" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
   local report
   report=$(report_of "$SBX")
   assert_contains "update report reflects new version" "v0.23.3" "$report"
-  assert_contains "update report shows refreshed pid" "->" "$report"
   assert_not_contains "update did not use --no-backup" "--no-backup" "$SBX/calls.log"
 }
 
-test_update_safety_unchanged_permits_restarts() {
-  new_sandbox update_safety_unchanged
-  : >"$SBX/fixtures/no_upstream_gateway_restart"
-  run_script "$SBX" update
-  assert_eq "safety unchanged exit" "0" "$(status_of "$SBX")"
-  assert_contains "safety unchanged updated" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "safety unchanged gateway restart once" "1" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-  assert_eq "safety unchanged backend restart once" "1" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
-  assert_eq "safety unchanged one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
-}
 
 test_update_post_update_conflict_prevents_restarts() {
   new_sandbox update_post_conflict
   : >"$SBX/fixtures/post_update_conflict"
   run_script "$SBX" update
-  assert_eq "post-update conflict exit" "1" "$(status_of "$SBX")"
-  assert_contains "post-update conflict not success" "STATUS: PARTIAL" "$SBX/stdout.txt"
+  assert_eq "post-update conflict exit" "2" "$(status_of "$SBX")"
+  assert_contains "post-update conflict blocked" "STATUS: BLOCKED" "$SBX/stdout.txt"
   assert_not_contains "post-update conflict not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "post-update conflict prevented gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-  assert_eq "post-update conflict prevented backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
-  local report
-  report=$(report_of "$SBX")
-  assert_contains "post-update conflict recorded" "deliberately prevented" "$report"
-  assert_eq "post-update conflict still one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+  assert_eq "post-update conflict no gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
+  assert_eq "post-update conflict no backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
+  assert_eq "post-update conflict still one update" "1" "$(count_matches 'update --yes' "$SBX/calls.log")"
 }
 
-test_update_safety_owner_change_before_gateway() {
-  new_sandbox update_safety_owner
-  : >"$SBX/fixtures/safety_owner_change"
-  run_script "$SBX" update
-  assert_eq "safety owner change exit" "1" "$(status_of "$SBX")"
-  assert_contains "safety owner change partial" "STATUS: PARTIAL" "$SBX/stdout.txt"
-  assert_not_contains "safety owner change not success" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "safety owner change no gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-  assert_eq "safety owner change no backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
-  assert_eq "safety owner change one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
-  local report
-  report=$(report_of "$SBX")
-  assert_contains "safety owner change reported" "execution-account" "$report"
-}
 
-test_update_safety_scope_change() {
-  new_sandbox update_safety_scope
-  : >"$SBX/fixtures/safety_scope_change"
-  run_script "$SBX" update
-  assert_eq "safety scope change exit" "1" "$(status_of "$SBX")"
-  assert_contains "safety scope change partial" "STATUS: PARTIAL" "$SBX/stdout.txt"
-  assert_not_contains "safety scope change not success" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "safety scope change no gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-  assert_eq "safety scope change no backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
-  assert_eq "safety scope change one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
-  local report
-  report=$(report_of "$SBX")
-  assert_contains "safety scope change reported" "supervisor-scope" "$report"
-}
 
-test_update_safety_backend_change_between_restarts() {
-  new_sandbox update_safety_backend
-  : >"$SBX/fixtures/safety_backend_change"
-  : >"$SBX/fixtures/no_upstream_gateway_restart"
-  run_script "$SBX" update
-  assert_eq "safety backend change exit" "1" "$(status_of "$SBX")"
-  assert_contains "safety backend change partial" "STATUS: PARTIAL" "$SBX/stdout.txt"
-  assert_not_contains "safety backend change not success" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "safety backend change gateway restarted" "1" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-  assert_eq "safety backend change backend prevented" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
-  assert_eq "safety backend change one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
-  local report
-  report=$(report_of "$SBX")
-  assert_contains "safety backend change reported" "exec-start" "$report"
-}
 
-test_update_safety_checkout_change() {
-  new_sandbox update_safety_checkout
-  : >"$SBX/fixtures/safety_checkout_change"
-  run_script "$SBX" update
-  assert_eq "safety checkout change exit" "1" "$(status_of "$SBX")"
-  assert_contains "safety checkout change partial" "STATUS: PARTIAL" "$SBX/stdout.txt"
-  assert_not_contains "safety checkout change not success" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "safety checkout change no gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-  assert_eq "safety checkout change no backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
-  assert_eq "safety checkout change one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
-  local report
-  report=$(report_of "$SBX")
-  assert_contains "safety checkout change reported" "exec-start" "$report"
-}
 
-test_update_safety_checkout_rebind() {
-  new_sandbox update_safety_checkout_rebind
-  mkdir -p "$SBX/exec" "$SBX/other"
-  printf '#!/bin/sh\nexit 0\n' >"$SBX/other/hermes"
-  chmod +x "$SBX/other/hermes"
-  ln -sfn "$SBX/checkout/.hermes/bin/hermes" "$SBX/exec/hermes"
-  : >"$SBX/fixtures/safety_checkout_rebind"
-  run_script "$SBX" update
-  assert_eq "safety checkout rebind exit" "1" "$(status_of "$SBX")"
-  assert_contains "safety checkout rebind partial" "STATUS: PARTIAL" "$SBX/stdout.txt"
-  assert_not_contains "safety checkout rebind not success" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "safety checkout rebind no gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-  assert_eq "safety checkout rebind no backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
-  assert_eq "safety checkout rebind one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
-  local report
-  report=$(report_of "$SBX")
-  assert_contains "safety checkout rebind reported" "checkout-binding" "$report"
-}
 
-test_update_safety_discovery_failure() {
-  new_sandbox update_safety_discovery_fail
-  : >"$SBX/fixtures/safety_discovery_fail"
-  run_script "$SBX" update
-  assert_eq "safety discovery failure exit" "1" "$(status_of "$SBX")"
-  assert_contains "safety discovery failure partial" "STATUS: PARTIAL" "$SBX/stdout.txt"
-  assert_not_contains "safety discovery failure not success" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "safety discovery failure no gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-  assert_eq "safety discovery failure no backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
-  assert_eq "safety discovery failure one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
-  local report
-  report=$(report_of "$SBX")
-  assert_contains "safety discovery failure reported" "system-scope systemd discovery failed" "$report"
-}
 
-test_update_safety_incomplete_evidence() {
-  new_sandbox update_safety_incomplete
-  : >"$SBX/fixtures/safety_incomplete_evidence"
-  run_script "$SBX" update
-  assert_eq "safety incomplete exit" "1" "$(status_of "$SBX")"
-  assert_contains "safety incomplete partial" "STATUS: PARTIAL" "$SBX/stdout.txt"
-  assert_not_contains "safety incomplete not success" "STATUS: UPDATED" "$SBX/stdout.txt"
-  assert_eq "safety incomplete no gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-  assert_eq "safety incomplete no backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
-  assert_eq "safety incomplete one update" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
-  local report
-  report=$(report_of "$SBX")
-  assert_contains "safety incomplete reported" "ExecStart is unavailable" "$report"
-}
 
 test_update_respects_upstream_restart() {
   new_sandbox update_upstream_restart
@@ -697,14 +591,6 @@ test_update_respects_upstream_restart() {
   assert_eq "no duplicate backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
 }
 
-test_update_gateway_not_refreshed() {
-  new_sandbox update_gateway_stale
-  : >"$SBX/fixtures/no_upstream_gateway_restart"
-  run_script "$SBX" update
-  assert_eq "gateway stale exit" "0" "$(status_of "$SBX")"
-  assert_contains "gateway manual restart issued once" "gateway restart" "$SBX/calls.log"
-  assert_eq "one gateway restart" "1" "$(count_matches 'gateway restart' "$SBX/calls.log")"
-}
 
 test_update_partial_receipt() {
   new_sandbox update_partial
@@ -715,7 +601,7 @@ test_update_partial_receipt() {
   local report
   report=$(report_of "$SBX")
   assert_contains "update partial reason" "unresolved follow-up" "$report"
-  assert_eq "partial still one update call" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+  assert_eq "partial still one update call" "1" "$(count_matches 'update --yes' "$SBX/calls.log")"
 }
 
 test_update_failed_no_retry() {
@@ -724,7 +610,7 @@ test_update_failed_no_retry() {
   run_script "$SBX" update
   assert_eq "update failed exit" "1" "$(status_of "$SBX")"
   assert_contains "update failed verdict" "STATUS: FAILED" "$SBX/stdout.txt"
-  assert_eq "failed updater run exactly once" "1" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+  assert_eq "failed updater run exactly once" "1" "$(count_matches 'update --yes' "$SBX/calls.log")"
 }
 
 test_update_already_current() {
@@ -733,7 +619,7 @@ test_update_already_current() {
   run_script "$SBX" update
   assert_eq "already current exit" "0" "$(status_of "$SBX")"
   assert_contains "already current verdict" "STATUS: ALREADY_CURRENT" "$SBX/stdout.txt"
-  assert_eq "already current no updater call" "0" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+  assert_eq "already current no updater call" "0" "$(count_matches 'update --yes' "$SBX/calls.log")"
 }
 
 test_check_no_backup_rejected() {
@@ -795,7 +681,7 @@ test_update_git_status_failure() {
   run_script "$SBX" update
   assert_eq "git status failure update exit" "2" "$(status_of "$SBX")"
   assert_contains "git status failure blocks update" "STATUS: BLOCKED" "$SBX/stdout.txt"
-  assert_eq "git status failure made no update call" "0" "$(count_matches 'update --set-channel' "$SBX/calls.log")"
+  assert_eq "git status failure made no update call" "0" "$(count_matches 'update --yes' "$SBX/calls.log")"
 }
 
 test_check_missing_receipt() {
@@ -886,17 +772,8 @@ test_update_blocked_dirty
 test_update_blocked_migration
 test_update_blocked_sudo
 test_update_success
-test_update_safety_unchanged_permits_restarts
 test_update_post_update_conflict_prevents_restarts
-test_update_safety_owner_change_before_gateway
-test_update_safety_scope_change
-test_update_safety_backend_change_between_restarts
-test_update_safety_checkout_change
-test_update_safety_checkout_rebind
-test_update_safety_discovery_failure
-test_update_safety_incomplete_evidence
 test_update_respects_upstream_restart
-test_update_gateway_not_refreshed
 test_update_partial_receipt
 test_update_failed_no_retry
 test_update_already_current

@@ -68,12 +68,13 @@ unapproved multiplex fold, an existing update lock, or unavailable passwordless
 sudo for a system-scope backend refresh. It then runs **one**:
 
 ```bash
-hermes update --set-channel stable --yes
+hermes update --yes
 ```
 
-It refreshes only the preflight-verified separately supervised backend if the
-upstream updater did not, verifies the PID changed, checks every expected
-profile, and treats receipt `followups[]` or
+Hermes owns service lifecycle after the update. The wrapper does not restart
+services; it verifies the installed release, Git revision, expected/served
+profiles, native receipt, and backend readiness by bounded polling of
+`/api/status`. It treats receipt `followups[]` or
 `gateway_restart.incomplete=true` as `PARTIAL`, never as success.
 
 ## Windows 11
@@ -93,7 +94,7 @@ Owner detection is mandatory and read-only:
 
 | Detected owner | Allowed update path |
 |---|---|
-| Source build | `hermes update --set-channel stable --yes` |
+| Source build | `hermes update --yes` |
 | Microsoft Store (`NousResearchInc.HermesAgent`, product `9PMXK8CZC7KR`) | `winget upgrade --id 9PMXK8CZC7KR --exact --source msstore ...` |
 | Signed sideload MSIX (`NousResearch.HermesBundled`) + verified descriptor | `Add-AppxPackage -AppInstallerFile ...` |
 | Source + MSIX both present | `BLOCKED` |
@@ -145,7 +146,7 @@ binding, blocked update (dirty/migration/sudo), successful update (one updater
 call, backend PID refresh), upstream restart respect, stale gateway refresh,
 partial receipt, updater failure with no retry, already-current, argument
 rejection, provenance failures, unverified health states, post-update restart
-safety, and redaction. Current result: **154 assertions passed**.
+safety, and redaction. Current result: **96 assertions passed**.
 
 Windows (must run on a Windows host):
 

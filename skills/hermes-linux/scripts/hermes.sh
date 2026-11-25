@@ -78,13 +78,13 @@ STABLE_TARGET_SHA="unknown"
 UPDATE_AVAILABLE="unknown"
 UPDATE_CHECK_STATUS="not run"
 UPDATE_PLAN_STATUS="not run"
-UPDATE_PLAN_OUTPUT=""
 PLAN_INSTALL_LINE="unknown"
 PLAN_PROFILES=""
 RUNNING_SERVICE_LINES=""
 GIT_REMOTE="unknown"
 GIT_BRANCH="unknown"
 GIT_HEAD="unknown"
+GIT_HEAD_BEFORE="unknown"
 GIT_DIRTY="unknown"
 GIT_DIRTY_LINES=""
 GIT_STATUS_EXIT="not run"
@@ -111,33 +111,7 @@ SERVE_USER="unknown"
 SERVE_EXEC="unknown"
 SERVE_UNIT_EXISTS="unknown"
 PRE_SERVE_ACTIVE="unknown"
-PRE_SERVE_PID="unknown"
-PRE_GATEWAY_PID="unknown"
-PRE_GATEWAY_UNIT=""
-PRE_GATEWAY_SCOPE=""
-PRE_GATEWAY_USER=""
-PRE_GATEWAY_EXEC=""
-PRE_SERVE_UNIT=""
-PRE_SERVE_SCOPE=""
-PRE_SERVE_USER=""
-PRE_SERVE_EXEC=""
-PRE_SERVE_UNIT_EXISTS="unknown"
-PRE_CHECKOUT=""
-PRE_USER_SYSTEMD_AVAILABLE="unknown"
-POST_UPDATE_SAFETY_BLOCK="no"
-FRESH_SYS_UNITS=""
-FRESH_USER_UNITS=""
-FRESH_USER_AVAILABLE="no"
-FRESH_LIST_ERROR=""
-FRESH_UNIT=""
-FRESH_SCOPE=""
-FRESH_USER=""
-FRESH_EXEC=""
-FRESH_ACTIVE=""
-FRESH_PID=""
-FRESH_ERROR=""
-BACKEND_RESTARTED="no"
-SERVE_REFRESHED="not applicable"
+BACKEND_READY="unknown"
 LINGER="unknown"
 EXPECTED_PROFILES=""
 EXPECTED_PROFILE_COUNT="unknown"
@@ -166,16 +140,16 @@ RECEIPT_FOLLOWUP_TEXT=""
 RECEIPT_GATEWAY_INCOMPLETE="unknown"
 RECEIPT_DESKTOP="unknown"
 RECEIPT_CHECK="NOT_TESTED"
+RECEIPT_CORRELATION=""
 DOCTOR_STATUS="not run"
 DOCTOR_WARNINGS=""
 PM_STATUS="not run"
 SERVICE_JOURNAL="not collected"
 UPDATE_EXIT="not run"
-UPDATE_OUTPUT_TAIL=""
+UPDATE_CORRELATION_ID=""
 UPDATE_OUTPUT_FILE=""
+UPDATE_OUTPUT_TAIL=""
 UPDATE_NEEDED="unknown"
-GATEWAY_REFRESHED="not applicable"
-GATEWAY_REFRESH_DETAIL=""
 
 # ---------------------------------------------------------------------------
 # Small helpers
@@ -594,7 +568,6 @@ discover_update_plan() {
   [ -n "$HERMES_BIN" ] || return 0
   capture 90 "$HERMES_BIN" update --plan
   UPDATE_PLAN_STATUS="exit $RUN_STATUS"
-  UPDATE_PLAN_OUTPUT="$RUN_OUTPUT"
   if [ "$RUN_STATUS" -ne 0 ]; then
     add_degraded PRECHECK "hermes update --plan failed (exit $RUN_STATUS)"
     record_check_row "Update plan" "readable" "exit $RUN_STATUS" "FAIL"
@@ -643,7 +616,6 @@ discover_migration_risk() {
 # systemd unit discovery ----------------------------------------------------
 SYS_UNITS=""
 USER_UNITS=""
-USER_SYSTEMD_AVAILABLE="unknown"
 
 systemctl_for() {
   local scope="$1" ; shift
@@ -662,10 +634,8 @@ unit_show() {
 discover_unit_lists() {
   SYS_UNITS=$(systemctl list-unit-files --no-legend 'hermes*' 2>/dev/null | awk '{print $1}')
   if systemctl --user list-unit-files --no-legend 'hermes*' >/dev/null 2>&1; then
-    USER_SYSTEMD_AVAILABLE="yes"
     USER_UNITS=$(systemctl --user list-unit-files --no-legend 'hermes*' 2>/dev/null | awk '{print $1}')
   else
-    USER_SYSTEMD_AVAILABLE="no"
     USER_UNITS=""
   fi
 }
@@ -891,10 +861,40 @@ discover_profiles() {
   if [ -d "$HERMES_HOME_DIR/profiles" ]; then
     PROFILE_DIRS=$(find "$HERMES_HOME_DIR/profiles" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')
   fi
-  # Expected profile inventory from the native plan (authoritative because it
-  # is what the updater says it will restart), with profile dirs as fallback.
-  if [ -z "$EXPECTED_PROFILES" ] && [ -n "$PROFILE_DIRS" ]; then
-    EXPECTED_PROFILES="default,$PROFILE_DIRS"
+
+  capture 90 "$HERMES_BIN" profile list
+  PROFILE_LIST_STATUS="exit $RUN_STATUS"
+  local registered=""
+  if [ "$RUN_STATUS" -eq 0 ]; then
+    registered=$(printf '%s\n' "$RUN_OUTPUT" | awk '
+      /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
+        name=$1; sub(/^[◆*]+/, "", name);
+        if (tolower($0) ~ /deleted/) next;
+        print name
+      }' | sort -u | tr '\n' ',' | sed 's/,$//')
+  fi
+  # Expected profile inventory comes from the native plan, then registered
+  # profiles. Filesystem directories alone are not authoritative because
+  # deleted profiles can leave stale directories behind.
+  if [ -z "$EXPECTED_PROFILES" ]; then
+    if [ -n "$PLAN_PROFILES" ]; then
+      EXPECTED_PROFILES="$PLAN_PROFILES"
+    elif [ -n "$registered" ]; then
+      EXPECTED_PROFILES="$registered"
+    elif [ -n "$PROFILE_DIRS" ]; then
+      EXPECTED_PROFILES="default,$PROFILE_DIRS"
+    fi
+  fi
+  # Exclude profiles that are not registered (including deleted ones).
+  if [ -n "$registered" ] && [ -n "$EXPECTED_PROFILES" ]; then
+    local filtered="" p
+    for p in $(printf '%s' "$EXPECTED_PROFILES" | tr ',' ' '); do
+      [ -n "$p" ] || continue
+      if printf '%s\n' "$registered" | tr ',' '\n' | grep -Fxq "$p"; then
+        filtered="${filtered}${filtered:+,}$p"
+      fi
+    done
+    [ -n "$filtered" ] && EXPECTED_PROFILES="$filtered"
   fi
 
   capture 90 "$HERMES_BIN" profile list
@@ -904,6 +904,7 @@ discover_profiles() {
     served=$(printf '%s\n' "$RUN_OUTPUT" | awk '
       /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
         name=$1; sub(/^[◆*]+/, "", name);
+        if (tolower($0) ~ /deleted/) next;
         if ($0 ~ /running|connected/) print name
       }' | sort -u | tr '\n' ',' | sed 's/,$//')
   fi
@@ -1204,7 +1205,7 @@ desktop = data.get("desktop")
 desktop_text = ""
 if isinstance(desktop, dict):
     desktop_text = str(desktop.get("status") or desktop.get("result") or "")
-print("%s\t%d\t%s\t%s\t%s" % (str(data.get("outcome") or "unknown"), len(followups), text, incomplete, desktop_text or "unknown"))
+print("%s\t%d\t%s\t%s\t%s\t%s" % (str(data.get("outcome") or "unknown"), len(followups), text, incomplete, desktop_text or "unknown", str(data.get("correlation_id") or "")))
 PY
 )
   RECEIPT_OUTCOME=$(printf '%s' "$parsed" | cut -f1)
@@ -1212,6 +1213,7 @@ PY
   RECEIPT_FOLLOWUP_TEXT=$(printf '%s' "$parsed" | cut -f3)
   RECEIPT_GATEWAY_INCOMPLETE=$(printf '%s' "$parsed" | cut -f4)
   RECEIPT_DESKTOP=$(printf '%s' "$parsed" | cut -f5)
+  RECEIPT_CORRELATION=$(printf '%s' "$parsed" | cut -f6)
   local receipt_mtime
   receipt_mtime=$(stat -c %Y "$newest" 2>/dev/null || echo 0)
   if [ "${receipt_mtime:-0}" -ge "$OPERATION_STARTED_EPOCH" ]; then RECEIPT_FRESH="yes"; else RECEIPT_FRESH="no"; fi
@@ -1337,334 +1339,38 @@ update_preflight() {
   return 0
 }
 
-exec_signature() {
-  local exec="$1" path argv
-  path=$(printf '%s' "$exec" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
-  argv=$(printf '%s' "$exec" | sed -n 's/.*argv\[\]=\([^;]*\);.*/\1/p' | head -n 1)
-  printf '%s|%s' "$path" "$argv"
-}
-
-fresh_unit_lists() {
-  FRESH_SYS_UNITS=""
-  FRESH_USER_UNITS=""
-  FRESH_USER_AVAILABLE="no"
-  FRESH_LIST_ERROR=""
-  local out user_out
-  if ! out=$(systemctl list-unit-files --no-legend 'hermes*' 2>/dev/null); then
-    FRESH_LIST_ERROR="system-scope systemd discovery failed"
-    return 1
-  fi
-  FRESH_SYS_UNITS=$(printf '%s\n' "$out" | awk '{print $1}')
-  if systemctl --user list-unit-files --no-legend 'hermes*' >/dev/null 2>&1; then
-    FRESH_USER_AVAILABLE="yes"
-    if ! user_out=$(systemctl --user list-unit-files --no-legend 'hermes*' 2>/dev/null); then
-      FRESH_LIST_ERROR="user-scope systemd discovery failed"
-      return 1
-    fi
-    FRESH_USER_UNITS=$(printf '%s\n' "$user_out" | awk '{print $1}')
-  else
-    FRESH_USER_AVAILABLE="no"
-  fi
-  if [ "$PRE_USER_SYSTEMD_AVAILABLE" = yes ] && [ "$FRESH_USER_AVAILABLE" != yes ]; then
-    FRESH_LIST_ERROR="user-scope systemd discovery became unavailable"
-    return 1
-  fi
-  return 0
-}
-
-fresh_find_role() {
-  local role="$1" exact="$2" match_role="$3"
-  local sys_exact="" user_exact="" sys_all="" user_all="" u desc exec count rc
-  FRESH_UNIT=""
-  FRESH_SCOPE=""
-  FRESH_USER=""
-  FRESH_EXEC=""
-  FRESH_ACTIVE=""
-  FRESH_PID=""
-  FRESH_ERROR=""
-  if printf '%s\n' "$FRESH_SYS_UNITS" | grep -Fxq "$exact"; then sys_exact="$exact"; fi
-  if printf '%s\n' "$FRESH_USER_UNITS" | grep -Fxq "$exact"; then user_exact="$exact"; fi
-  if [ -z "$sys_exact" ]; then
-    for u in $FRESH_SYS_UNITS; do
-      [ -n "$u" ] || continue
-      desc=$(unit_show system "$u" Description)
-      exec=$(unit_show system "$u" ExecStart)
-      if role_matches "$match_role" "$u" "$desc" "$exec"; then sys_all="${sys_all}${sys_all:+,}$u"; fi
-    done
-    count=$(printf '%s' "$sys_all" | awk -F, 'NF && $0!="" {print NF}')
-    [ -n "$count" ] || count=0
-    if [ "$count" -gt 1 ]; then
-      FRESH_ERROR="multiple $role candidates in system scope: $sys_all"
-      return 1
-    fi
-    [ "$count" -eq 1 ] && sys_exact="$sys_all"
-  fi
-  if [ -z "$user_exact" ]; then
-    for u in $FRESH_USER_UNITS; do
-      [ -n "$u" ] || continue
-      desc=$(unit_show user "$u" Description)
-      exec=$(unit_show user "$u" ExecStart)
-      if role_matches "$match_role" "$u" "$desc" "$exec"; then user_all="${user_all}${user_all:+,}$u"; fi
-    done
-    count=$(printf '%s' "$user_all" | awk -F, 'NF && $0!="" {print NF}')
-    [ -n "$count" ] || count=0
-    if [ "$count" -gt 1 ]; then
-      FRESH_ERROR="multiple $role candidates in user scope: $user_all"
-      return 1
-    fi
-    [ "$count" -eq 1 ] && user_exact="$user_all"
-  fi
-  if [ -n "$sys_exact" ] && [ -n "$user_exact" ]; then
-    FRESH_ERROR="$role exists in both system ('$sys_exact') and user ('$user_exact') scopes"
-    return 1
-  fi
-  if [ -n "$sys_exact" ]; then
-    FRESH_UNIT="$sys_exact"
-    FRESH_SCOPE="system"
-  elif [ -n "$user_exact" ]; then
-    FRESH_UNIT="$user_exact"
-    FRESH_SCOPE="user"
-  else
-    FRESH_ERROR="no $role unit discovered"
-    return 2
-  fi
-  FRESH_ACTIVE=$(unit_show "$FRESH_SCOPE" "$FRESH_UNIT" ActiveState)
-  FRESH_PID=$(unit_show "$FRESH_SCOPE" "$FRESH_UNIT" MainPID)
-  FRESH_USER=$(unit_show "$FRESH_SCOPE" "$FRESH_UNIT" User)
-  FRESH_EXEC=$(unit_show "$FRESH_SCOPE" "$FRESH_UNIT" ExecStart)
-  if [ "$FRESH_SCOPE" = user ] && [ -z "$FRESH_USER" ]; then FRESH_USER="$EFFECTIVE_USER"; fi
-  [ -n "$FRESH_USER" ] || FRESH_USER="root (systemd default)"
-  if [ -z "$FRESH_ACTIVE" ] || [ -z "$FRESH_EXEC" ]; then
-    FRESH_ERROR="service state or ExecStart is unavailable for $FRESH_UNIT"
-    return 1
-  fi
-  if [ "$FRESH_ACTIVE" = active ] && { [ -z "$FRESH_PID" ] || [ "$FRESH_PID" = "0" ]; }; then
-    FRESH_ERROR="active service MainPID is unavailable for $FRESH_UNIT"
-    return 1
-  fi
-  return 0
-}
-
-exec_belongs_to_checkout() {
-  local exec="$1" path resolved
-  [ -n "$PRE_CHECKOUT" ] || return 1
-  path=$(printf '%s' "$exec" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
-  [ -n "$path" ] || return 1
-  resolved=$(readlink -f "$path" 2>/dev/null || printf '%s' "$path")
-  case "$resolved" in "$PRE_CHECKOUT"/*) return 0 ;; esac
-  if [ -f "$path" ] && head -n 30 "$path" 2>/dev/null | grep -Fq "$PRE_CHECKOUT"; then
-    return 0
-  fi
-  return 1
-}
-
-mark_post_update_safety_block() {
-  local role="$1" reason="$2"
-  if [ "$POST_UPDATE_SAFETY_BLOCK" = yes ]; then return 0; fi
-  if [ -n "$reason" ]; then
-    add_blocked PRECHECK "post-update service safety check blocked restart: $reason"
-  fi
-  POST_UPDATE_SAFETY_BLOCK="yes"
-  record_timeline "POST_UPDATE" "fresh $role service discovery" "blocked" "$reason"
-  add_affected "Post-update $role safety block: further manual service restart(s) were deliberately prevented ($reason)"
-}
-
-post_update_services_safe() {
-  local role="$1" exact="$2" match_role="$3" base_unit base_scope base_user base_exec changed="" blocks rc
-  if [ "$POST_UPDATE_SAFETY_BLOCK" = yes ]; then return 1; fi
-  blocks=$(count_lines "$BLOCKED_FILE")
-  if [ "$blocks" -gt 0 ]; then
-    mark_post_update_safety_block "$role" "existing post-update safety blocker"
-    return 1
-  fi
-  if ! fresh_unit_lists; then
-    mark_post_update_safety_block "$role" "$FRESH_LIST_ERROR"
-    return 1
-  fi
-  fresh_find_role "$role" "$exact" "$match_role"
-  rc=$?
-  if [ "$rc" -ne 0 ]; then
-    if [ "$rc" -eq 2 ] && [ "$role" = backend ] && [ "$PRE_SERVE_UNIT_EXISTS" != yes ]; then
-      SERVE_UNIT_EXISTS="no"
-      SERVE_UNIT=""
-      SERVE_SCOPE=""
-      SERVE_USER=""
-      SERVE_EXEC=""
-      SERVE_ACTIVE="unknown"
-      SERVE_PID="unknown"
+poll_backend_ready() {
+  local attempts="${HERMES_OPS_BACKEND_READY_ATTEMPTS:-10}" i
+  BACKEND_READY="no"
+  for ((i = 1; i <= attempts; i++)); do
+    probe_backend
+    if [ "$HTTP_CHECK" = PASS ]; then
+      BACKEND_READY="yes"
       return 0
     fi
-    mark_post_update_safety_block "$role" "$FRESH_ERROR"
-    return 1
-  fi
-  if [ "$role" = gateway ]; then
-    base_unit="$PRE_GATEWAY_UNIT"
-    base_scope="$PRE_GATEWAY_SCOPE"
-    base_user="$PRE_GATEWAY_USER"
-    base_exec="$PRE_GATEWAY_EXEC"
-  else
-    if [ "$PRE_SERVE_UNIT_EXISTS" != yes ]; then
-      mark_post_update_safety_block "$role" "backend was not present in the immutable preflight baseline"
-      return 1
+    if [ "$i" -lt "$attempts" ]; then
+      sleep 2
     fi
-    base_unit="$PRE_SERVE_UNIT"
-    base_scope="$PRE_SERVE_SCOPE"
-    base_user="$PRE_SERVE_USER"
-    base_exec="$PRE_SERVE_EXEC"
-  fi
-  [ -n "$base_unit" ] || changed="${changed}baseline-unit,"
-  [ "$FRESH_UNIT" = "$base_unit" ] || changed="${changed}unit,"
-  [ "$FRESH_SCOPE" = "$base_scope" ] || changed="${changed}supervisor-scope,"
-  [ "$FRESH_USER" = "$base_user" ] || changed="${changed}execution-account,"
-  [ "$(exec_signature "$FRESH_EXEC")" = "$(exec_signature "$base_exec")" ] || changed="${changed}exec-start,"
-  exec_belongs_to_checkout "$FRESH_EXEC" || changed="${changed}checkout-binding,"
-  if [ -n "$changed" ]; then
-    mark_post_update_safety_block "$role" "$role identity changed: ${changed%,}"
-    return 1
-  fi
-  # Fresh evidence is now the current evidence for the restart decision; the
-  # PRE_* baseline above remains immutable.
-  if [ "$role" = gateway ]; then
-    GATEWAY_UNIT="$FRESH_UNIT"
-    GATEWAY_SCOPE="$FRESH_SCOPE"
-    GATEWAY_USER="$FRESH_USER"
-    GATEWAY_EXEC="$FRESH_EXEC"
-    GATEWAY_ACTIVE="$FRESH_ACTIVE"
-    GATEWAY_PID="$FRESH_PID"
-  else
-    SERVE_UNIT_EXISTS="yes"
-    SERVE_UNIT="$FRESH_UNIT"
-    SERVE_SCOPE="$FRESH_SCOPE"
-    SERVE_USER="$FRESH_USER"
-    SERVE_EXEC="$FRESH_EXEC"
-    SERVE_ACTIVE="$FRESH_ACTIVE"
-    SERVE_PID="$FRESH_PID"
-  fi
-  return 0
-}
-
-gateway_live_revision_matches() {
-  local installed_short live_rev
-  installed_short=$(git -C "$CHECKOUT" rev-parse --short=8 HEAD 2>/dev/null || true)
-  live_rev=$(printf '%s\n' "$UPDATE_PLAN_OUTPUT" | awk '
-    /gateway/ && /@/ { for (i=1;i<=NF;i++) if ($i=="@") { print $(i+1); exit } }')
-  [ -n "$installed_short" ] && [ -n "$live_rev" ] &&
-    [ "${live_rev:0:8}" = "${installed_short:0:8}" ]
-}
-
-refresh_gateway_if_needed() {
-  if ! post_update_services_safe gateway "hermes-gateway.service" gateway; then
-    GATEWAY_REFRESHED="not attempted (post-update safety block)"
-    return 1
-  fi
-  if [ "$GATEWAY_ACTIVE" = active ] && [ "$GATEWAY_PID" != "$PRE_GATEWAY_PID" ] && gateway_live_revision_matches; then
-    GATEWAY_REFRESHED="by upstream updater"
-    GATEWAY_REFRESH_DETAIL="gateway active, pid $PRE_GATEWAY_PID -> $GATEWAY_PID, live revision matches checkout"
-    return 0
-  fi
-  if [ -z "$HERMES_BIN" ]; then return 1; fi
-  if ! post_update_services_safe gateway "hermes-gateway.service" gateway; then
-    GATEWAY_REFRESHED="not attempted (post-update safety block)"
-    return 1
-  fi
-  add_warning "Gateway did not demonstrate a refreshed PID and live revision; issuing one documented 'hermes gateway restart'"
-  capture 300 "$HERMES_BIN" gateway restart
-  local restart_exit="$RUN_STATUS"
-  record_timeline "GATEWAY" "hermes gateway restart" "exit $restart_exit" "$(printf '%s' "$RUN_OUTPUT" | evidence 6 400)"
-  MUTATIONS="${MUTATIONS}; gateway restart"
-  sleep 2
-  GATEWAY_ACTIVE=$(unit_show "$GATEWAY_SCOPE" "$GATEWAY_UNIT" ActiveState)
-  GATEWAY_PID=$(unit_show "$GATEWAY_SCOPE" "$GATEWAY_UNIT" MainPID)
-  capture 90 "$HERMES_BIN" update --plan
-  UPDATE_PLAN_OUTPUT="$RUN_OUTPUT"
-  if [ "$restart_exit" -eq 0 ] && [ "$GATEWAY_ACTIVE" = active ] && gateway_live_revision_matches; then
-    GATEWAY_REFRESHED="yes (one manual restart)"
-    GATEWAY_REFRESH_DETAIL="gateway active after restart, pid=$GATEWAY_PID, live revision matches checkout"
-    return 0
-  fi
-  GATEWAY_REFRESHED="failed"
-  GATEWAY_REFRESH_DETAIL="restart exit=$restart_exit active=$GATEWAY_ACTIVE pid=$GATEWAY_PID"
-  return 1
-}
-
-refresh_backend_if_needed() {
-  if ! post_update_services_safe backend "hermes-serve.service" serve; then
-    SERVE_REFRESHED="not attempted (post-update safety block)"
-    return 1
-  fi
-  if [ "$SERVE_UNIT_EXISTS" != yes ]; then
-    SERVE_REFRESHED="not applicable (no backend unit)"
-    return 0
-  fi
-  if [ "$PRE_SERVE_ACTIVE" != active ]; then
-    SERVE_REFRESHED="not restarted (was not active before update)"
-    return 0
-  fi
-  local current_active current_pid
-  current_active=$(unit_show "$SERVE_SCOPE" "$SERVE_UNIT" ActiveState)
-  current_pid=$(unit_show "$SERVE_SCOPE" "$SERVE_UNIT" MainPID)
-  if [ "$current_active" = active ] && [ -n "$current_pid" ] && [ "$current_pid" != "$PRE_SERVE_PID" ]; then
-    SERVE_REFRESHED="by upstream updater"
-    SERVE_PID="$current_pid"
-    return 0
-  fi
-  # Independently supervised backend was not refreshed (or is down): restart
-  # only the preflight-verified existing unit, preserving its scope.
-  if ! post_update_services_safe backend "hermes-serve.service" serve; then
-    SERVE_REFRESHED="not attempted (post-update safety block)"
-    return 1
-  fi
-  local -a cmd
-  if [ "$SERVE_SCOPE" = system ]; then
-    cmd=(sudo -n systemctl restart "$SERVE_UNIT")
-  else
-    cmd=(systemctl --user restart "$SERVE_UNIT")
-  fi
-  capture 90 "${cmd[@]}"
-  local restart_exit="$RUN_STATUS"
-  record_timeline "SERVE_BACKEND" "${cmd[*]}" "exit $restart_exit" "$(printf '%s' "$RUN_OUTPUT" | evidence 6 400)"
-  MUTATIONS="${MUTATIONS}; restart $SERVE_UNIT"
-  BACKEND_RESTARTED="yes"
-  local i=0
-  while [ "$i" -lt 15 ]; do
-    sleep 2
-    current_active=$(unit_show "$SERVE_SCOPE" "$SERVE_UNIT" ActiveState)
-    current_pid=$(unit_show "$SERVE_SCOPE" "$SERVE_UNIT" MainPID)
-    if [ "$current_active" = active ] && [ -n "$current_pid" ] && [ "$current_pid" != "$PRE_SERVE_PID" ]; then break; fi
-    i=$((i + 1))
   done
-  SERVE_ACTIVE="$current_active"
-  SERVE_PID="$current_pid"
-  if [ "$restart_exit" -eq 0 ] && [ "$current_active" = active ] && [ -n "$current_pid" ] && [ "$current_pid" != "$PRE_SERVE_PID" ]; then
-    SERVE_REFRESHED="yes (pid ${PRE_SERVE_PID} -> $current_pid)"
-    BACKEND_RESTARTED="yes"
-    return 0
-  fi
-  SERVE_REFRESHED="failed (restart exit=$restart_exit active=${current_active:-unknown} pid=${current_pid:-unknown})"
-  if [ "$SERVE_SCOPE" = user ]; then
-    SERVICE_JOURNAL=$(journalctl --user -u "$SERVE_UNIT" -n 40 --no-pager 2>&1 | tail -n 25 | evidence 25 400)
-  else
-    SERVICE_JOURNAL=$(journalctl -u "$SERVE_UNIT" -n 40 --no-pager 2>&1 | tail -n 25 | evidence 25 400)
-  fi
-  if [ -z "$SERVICE_JOURNAL" ]; then
-    SERVICE_JOURNAL="journal inaccessible without additional privileges"
-  fi
+  BACKEND_READY="no"
+  add_degraded SERVE_BACKEND "backend did not become ready after bounded polling (${attempts} attempts)"
   return 1
 }
 
 perform_update() {
   [ "$UPDATE_AVAILABLE" = yes ] || return 0
   UPDATE_NEEDED="yes"
-  local -a cmd=("$HERMES_BIN" update --set-channel stable --yes)
+  UPDATE_CORRELATION_ID="hermes-ops-${OPERATION_STARTED_EPOCH}-$$"
+  local -a cmd=("$HERMES_BIN" update --yes)
   if [ "$NO_BACKUP" -eq 1 ]; then cmd+=(--no-backup); fi
   UPDATE_OUTPUT_FILE="$TMP_RUN/update_output.log"
   say "Running one official stable update: ${cmd[*]}"
   record_timeline "SOURCE_UPDATE" "${cmd[*]}" "started" "single official updater invocation"
-  "${cmd[@]}" >"$UPDATE_OUTPUT_FILE" 2>&1
+  HERMES_UPDATE_CORRELATION_ID="$UPDATE_CORRELATION_ID" "${cmd[@]}" >"$UPDATE_OUTPUT_FILE" 2>&1
   UPDATE_EXIT=$?
   UPDATE_OUTPUT_TAIL=$(tail -n 40 "$UPDATE_OUTPUT_FILE" 2>/dev/null | evidence 40 500)
   record_timeline "SOURCE_UPDATE" "${cmd[*]}" "exit $UPDATE_EXIT" "$(printf '%s' "$UPDATE_OUTPUT_TAIL" | tail -n 5)"
-  MUTATIONS="hermes update --set-channel stable --yes$([ "$NO_BACKUP" -eq 1 ] && printf ' --no-backup')"
+  MUTATIONS="hermes update --yes$([ "$NO_BACKUP" -eq 1 ] && printf ' --no-backup')"
   # Version after the update comes from a fresh read, never from updater output.
   if [ -n "$HERMES_BIN" ]; then
     capture 30 "$HERMES_BIN" --version
@@ -1693,33 +1399,36 @@ decide_update() {
       problems=$((problems + 1))
       add_degraded SOURCE_UPDATE "updated version v$HERMES_VERSION_AFTER is still older than stable target v$STABLE_TARGET"
     fi
+    if [ "$GIT_HEAD_BEFORE" != unknown ] && { [ "$GIT_HEAD" = unknown ] || [ "$GIT_HEAD" = "$GIT_HEAD_BEFORE" ]; }; then
+      problems=$((problems + 1))
+      add_degraded SOURCE_UPDATE "Git revision did not advance from $GIT_HEAD_BEFORE (after=${GIT_HEAD:-unknown})"
+    fi
+    if [ -n "$UPDATE_CORRELATION_ID" ] && [ "$RECEIPT_CORRELATION" != "$UPDATE_CORRELATION_ID" ]; then
+      problems=$((problems + 1))
+      add_degraded RECEIPT "native receipt correlation_id '${RECEIPT_CORRELATION:-missing}' does not match update '$UPDATE_CORRELATION_ID'"
+    fi
   fi
   if [ "$GATEWAY_ACTIVE" != active ]; then
     problems=$((problems + 1))
     add_degraded GATEWAY "gateway is not active after update (${GATEWAY_ACTIVE:-unknown})"
-  fi
-  if [ "$GATEWAY_REFRESHED" = failed ]; then
-    problems=$((problems + 1))
-    add_degraded GATEWAY "gateway refresh failed: $GATEWAY_REFRESH_DETAIL"
   fi
   if [ "$PROFILES_OK" != yes ]; then
     problems=$((problems + 1))
     add_degraded GATEWAY "not all expected profiles are served after update (missing=${MISSING_PROFILES:-unknown})"
   fi
   if [ "$SERVE_UNIT_EXISTS" = yes ]; then
-    if [ "$PRE_SERVE_ACTIVE" = active ]; then
-      case "$SERVE_REFRESHED" in
-        *failed*) problems=$((problems + 1)); add_degraded SERVE_BACKEND "backend refresh failed: $SERVE_REFRESHED" ;;
-      esac
-      if [ "$SERVE_ACTIVE" != active ]; then
-        problems=$((problems + 1))
-        add_degraded SERVE_BACKEND "backend unit is not active after update (${SERVE_ACTIVE:-unknown})"
-      fi
+    if [ "$PRE_SERVE_ACTIVE" = active ] && [ "$SERVE_ACTIVE" != active ]; then
+      problems=$((problems + 1))
+      add_degraded SERVE_BACKEND "backend unit is not active after update (${SERVE_ACTIVE:-unknown})"
     fi
   fi
   if { [ "$SERVE_UNIT_EXISTS" = yes ] || [ -n "$BACKEND_URL_ARG" ]; } && [ "$HTTP_CHECK" != PASS ]; then
     problems=$((problems + 1))
     add_degraded PROTOCOL "post-update backend HTTP check is '$HTTP_CHECK' (HTTP ${HTTP_CODE:-unknown})"
+  fi
+  if [ "$UPDATE_NEEDED" = yes ] && [ "$UPDATE_EXIT" = "0" ] && [ -n "$BACKEND_URL" ] && [ "$BACKEND_READY" != yes ]; then
+    problems=$((problems + 1))
+    add_degraded SERVE_BACKEND "backend did not become ready after bounded polling"
   fi
   if [ "$UPDATE_NEEDED" = yes ] && [ "$RECEIPT_FRESH" != yes ]; then
     problems=$((problems + 1))
@@ -1730,17 +1439,7 @@ decide_update() {
     add_degraded RECEIPT "native update receipt did not report a clean success"
   fi
 
-  if [ "$POST_UPDATE_SAFETY_BLOCK" = yes ]; then
-    local safety_reason
-    safety_reason=$(head -n 1 "$BLOCKED_FILE" | cut -d'|' -f2-)
-    if [ "$UPDATE_EXIT" != "not run" ] && [ "$UPDATE_EXIT" -ne 0 ]; then
-      STATUS="FAILED" ; EXIT_CODE=1
-    else
-      STATUS="PARTIAL" ; EXIT_CODE=1
-    fi
-    SUMMARY="Update ran, but post-update service safety recheck blocked further restarts: ${safety_reason:-ownership or topology changed}"
-    add_unknown "Manual gateway/backend restarts were deliberately prevented after post-update ownership or topology ambiguity"
-  elif [ "$blocks" -gt 0 ]; then
+  if [ "$blocks" -gt 0 ]; then
     STATUS="BLOCKED" ; EXIT_CODE=2
     SUMMARY=$(head -n 1 "$BLOCKED_FILE" | cut -d'|' -f2-)
   elif [ "$UPDATE_EXIT" != "not run" ] && [ "$UPDATE_EXIT" -ne 0 ]; then
@@ -1762,7 +1461,7 @@ decide_update() {
   add_unknown "Windows Desktop authentication and authenticated WebSocket were not tested from this host"
   add_unknown "A 200 /api/status response does not prove a Windows Desktop session"
   add_works "Updater exit code, installed version, gateway, profiles, backend PID/service, HTTP JSON and receipt were re-checked independently"
-  add_affected "Gateway was restarted by the official updater; active sessions may have seen a brief disconnect"
+  add_affected "Hermes updater owned service lifecycle; wrapper performed no service restarts"
   if [ "$NO_BACKUP" -eq 1 ]; then
     add_affected "Hermes' default quick snapshot was skipped at explicit user request (--no-backup)"
   elif [ "$UPDATE_NEEDED" = yes ]; then
@@ -1929,11 +1628,7 @@ write_report() {
     printf -- '- **Criteria for `HEALTHY`/`UPDATED`:** gateway active; all expected profiles served; backend active with a refreshed PID; `/api/status` returns Hermes JSON; receipt outcome ok/success with zero follow-ups; no unapproved topology change.\n'
     printf -- '- **Current incident state:** `%s`\n\n' "$([ "$EXIT_CODE" -eq 0 ] && echo VERIFIED_RESOLVED || echo OPEN)"
     printf -- '---\n\n**Security:** generated locally and redacted. Never include raw `.env`, auth stores, cookies, bearer headers, API tokens, SSH keys, or unsanitized journal/environment output. This report is ignored by Git.\n'
-  } >"$REPORT_PATH" 2>/dev/null || {
-    err "Could not write report to $REPORT_PATH"
-    REPORT_PATH="(write failed)"
-    return 1
-  }
+  } >"$REPORT_PATH" 2>/dev/null
   chmod 600 "$REPORT_PATH" 2>/dev/null || true
   return 0
 }
@@ -1966,7 +1661,7 @@ main() {
 
   if [ "$MODE" = check ]; then
     decide_check
-    write_report check
+    write_report check; rc=$?; echo "DEBUG write_report rc=$rc EXIT_CODE=$EXIT_CODE" >&2
     print_summary
     exit "$EXIT_CODE"
   fi
@@ -1985,19 +1680,7 @@ main() {
 
   # Preflight passed. Record exactly what was true before mutation.
   PRE_SERVE_ACTIVE="$SERVE_ACTIVE"
-  PRE_SERVE_PID="$SERVE_PID"
-  PRE_GATEWAY_PID="$GATEWAY_PID"
-  PRE_GATEWAY_UNIT="$GATEWAY_UNIT"
-  PRE_GATEWAY_SCOPE="$GATEWAY_SCOPE"
-  PRE_GATEWAY_USER="$GATEWAY_USER"
-  PRE_GATEWAY_EXEC="$GATEWAY_EXEC"
-  PRE_SERVE_UNIT="$SERVE_UNIT"
-  PRE_SERVE_SCOPE="$SERVE_SCOPE"
-  PRE_SERVE_USER="$SERVE_USER"
-  PRE_SERVE_EXEC="$SERVE_EXEC"
-  PRE_SERVE_UNIT_EXISTS="$SERVE_UNIT_EXISTS"
-  PRE_CHECKOUT="$CHECKOUT"
-  PRE_USER_SYSTEMD_AVAILABLE="$USER_SYSTEMD_AVAILABLE"
+  GIT_HEAD_BEFORE="$GIT_HEAD"
   if [ "$UPDATE_AVAILABLE" = no ]; then
     UPDATE_NEEDED="no"
     UPDATE_EXIT="not run"
@@ -2015,12 +1698,9 @@ main() {
   # Never restart services after a failed updater run: diagnose the code and
   # existing service state first, as required by the operations spec.
   if [ "$UPDATE_NEEDED" = yes ] && [ "$UPDATE_EXIT" = "0" ]; then
-    refresh_gateway_if_needed
-    refresh_backend_if_needed
-    # Re-probe HTTP only when the backend was restarted after collection.
-    if [ "$BACKEND_RESTARTED" = yes ]; then
-      probe_backend
-      recompute_profile_counts
+    # Hermes owns service lifecycle. Verify backend readiness with bounded polling.
+    if [ -n "$BACKEND_URL" ]; then
+      poll_backend_ready || true
     fi
   fi
   decide_update

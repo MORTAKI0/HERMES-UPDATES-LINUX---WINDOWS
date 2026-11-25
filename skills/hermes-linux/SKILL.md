@@ -96,23 +96,13 @@ Preflight (all read-only), then at most one controlled mutation sequence:
    inactive gateway/backend, unapproved multiplex topology change, an existing
    update lock, or unavailable passwordless sudo for a system-scope backend.
 2. Runs the official updater exactly once:
-   `hermes update --set-channel stable --yes` (plus `--no-backup` only when
-   explicitly requested).
-3. Re-reads version, plan, gateway, profiles, backend PID/service and receipt
+   `hermes update --yes` (plus `--no-backup` only when
+   explicitly requested), after preflight verifies the channel is `stable`.
+3. Re-reads version, Git revision, plan, gateway, profiles, backend service and receipt
    independently. It does not trust the updater's exit code.
-4. Restarts the gateway manually only if the verified live revision/PID did not
-   refresh; otherwise it respects the upstream restart. Immediately before that
-   restart it re-runs read-only discovery and blocks on any change or
-   incomplete evidence.
-5. Restarts **only the preflight-verified existing** independently supervised
-   backend, and only when the upstream updater did not. A backend that was
-   stopped before the update stays stopped. Discovery is refreshed again
-   immediately before the backend restart and compared with the immutable
-   preflight baseline; changes or missing evidence prevent all further manual
-   restarts.
-6. Verifies the backend PID changed, `/api/status` returns Hermes JSON, every
-   expected profile is served, and the fresh receipt has no required
-   follow-ups. A healthy gateway with a stale/dead backend is `PARTIAL`.
+4. Performs no wrapper-managed service restarts; Hermes owns its lifecycle.
+5. Polls backend `/api/status` with a bounded number of attempts and records readiness.
+6. Verifies the installed release, Git revision, expected/served profiles, backend service state, HTTP JSON, and fresh correlated receipt. A healthy gateway with a stale or dead backend is `PARTIAL`.
 7. Writes `reports/<host>/<UTC>-update.md`.
 
 ## Arguments and exit codes
