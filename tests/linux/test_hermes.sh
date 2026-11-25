@@ -60,7 +60,9 @@ new_sandbox() {
   git -C "$SBX/checkout" checkout -q --detach HEAD
   git -C "$SBX/checkout" commit --allow-empty -q -m "updated"
   git -C "$SBX/checkout" rev-parse --short=8 HEAD >"$SBX/target-sha"
-  git -C "$SBX/checkout" checkout -q --detach HEAD~1
+  git -C "$SBX/checkout" commit --allow-empty -q -m "wrong"
+  git -C "$SBX/checkout" rev-parse --short=8 HEAD >"$SBX/wrong-sha"
+  git -C "$SBX/checkout" checkout -q --detach HEAD~2
 
   # Fixtures.
   cat >"$SBX/fixtures/version.txt" <<EOF
@@ -175,7 +177,9 @@ case "${1:-}" in
       --yes)
         if [ -f "$fixtures/update_fail" ]; then echo "simulated updater failure"; exit 1; fi
         if [ -f "$fixtures/update_no_install" ]; then echo "no code installed"; exit 0; fi
-        if [ ! -f "$fixtures/wrong_revision" ]; then
+        if [ -f "$fixtures/advance_wrong_revision" ]; then
+          git -C "$FAKE_CHECKOUT" checkout -q --detach "$(cat "$FAKE_SBX/wrong-sha")"
+        elif [ ! -f "$fixtures/wrong_revision" ]; then
           git -C "$FAKE_CHECKOUT" checkout -q --detach "$(cat "$FAKE_SBX/target-sha")"
         fi
         cp "$fixtures/version_after.txt" "$fixtures/version.txt"
@@ -204,6 +208,9 @@ case "${1:-}" in
           printf '{"correlation_id":"%s","outcome":"success","followups":[{"step":"gateway_restart","reason":"deferred backend restart"}],"gateway_restart":{"incomplete":true}}\n' "$cid" >"$write_followup"
         else
           printf '{"correlation_id":"%s","outcome":"success","followups":[],"gateway_restart":{"incomplete":false},"desktop":{"status":"ok"}}\n' "$cid" >"$FAKE_SBX/home/.hermes/logs/update_receipts/update_$(date +%s%N).json"
+        fi
+        if [ -f "$fixtures/unrelated_latest" ]; then
+          printf '{"correlation_id":"unrelated","outcome":"failed","followups":[],"gateway_restart":{"incomplete":false}}\n' >"$FAKE_SBX/home/.hermes/logs/update_receipts/latest.json"
         fi
         echo "simulated successful update" ;;
       *) echo "unsupported update args: $*" >&2; exit 9 ;;
@@ -367,6 +374,12 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 if [ -f "$FAKE_SBX/fixtures/http_network_fail" ]; then exit 7; fi
+if [ -f "$FAKE_SBX/fixtures/delayed_backend_recovery" ]; then
+  count=$(( $(cat "$FAKE_SBX/state/curl_count" 2>/dev/null || echo 0) + 1 ))
+  echo "$count" >"$FAKE_SBX/state/curl_count"
+  limit=$(cat "$FAKE_SBX/fixtures/delayed_backend_fail_count" 2>/dev/null || echo 2)
+  if [ "$count" -le "$limit" ]; then exit 7; fi
+fi
 [ -n "$out" ] && cp "$FAKE_SBX/fixtures/http_body.json" "$out"
 [ -n "$hdr" ] && printf 'HTTP/1.1 %s\r\nContent-Type: application/json\r\n' "$(cat "$FAKE_SBX/fixtures/http_code.txt")" >"$hdr"
 printf '%s|application/json|0.01\n' "$(cat "$FAKE_SBX/fixtures/http_code.txt")"
@@ -377,7 +390,9 @@ MOCK
 #!/usr/bin/env bash
 if [ -f "$FAKE_SBX/fixtures/serve_no_bind" ]; then exit 0; fi
 pid=$(cat "$FAKE_SBX/pids/serve")
-printf 'LISTEN 0 2048 127.0.0.1:9119 0.0.0.0:* users:(("hermes",pid=%s,fd=9))\n' "$pid"
+addr="127.0.0.1:9119"
+if [ -f "$FAKE_SBX/fixtures/backend_wildcard_after" ] && grep -q 'v0.23.3' "$FAKE_SBX/fixtures/version.txt"; then addr="0.0.0.0:9119"; fi
+printf 'LISTEN 0 2048 %s 0.0.0.0:* users:(("hermes",pid=%s,fd=9))\n' "$addr" "$pid"
 MOCK
 
   # git mock: delegates to real git, with a controllable status failure.
@@ -412,6 +427,16 @@ MOCK
 printf 'fake journal: backend failed to start\nAuthorization: Bearer super-secret-token-value\n'
 MOCK
 
+  # sleep mock: fast tests, optional deterministic uptime advance.
+  cat >"$SBX/bin/sleep" <<'MOCK'
+#!/usr/bin/env bash
+if [ -n "${FAKE_UPTIME:-}" ]; then
+  cur=$(cat "$FAKE_UPTIME" 2>/dev/null || echo 0)
+  echo $(( cur + ${1:-0} )) >"$FAKE_UPTIME"
+fi
+exit 0
+MOCK
+
   chmod +x "$SBX/bin/"*
 }
 
@@ -419,9 +444,15 @@ run_script() {
   local dir="$1"; shift
   local ready_budget="90"
   [ -f "$dir/fixtures/short_ready_budget" ] && ready_budget="1"
+  local uptime_file=""
+  if [ -f "$dir/fixtures/fake_clock" ]; then
+    uptime_file="$dir/state/uptime"
+    echo "1000" >"$uptime_file"
+  fi
   env PATH="$dir/bin:/usr/bin:/bin" HOME="$dir/home" \
       HERMES_HOME="$dir/home/.hermes" HERMES_OPS_REPORT_DIR="$dir/reports" \
       HERMES_OPS_READY_BUDGET="$ready_budget" \
+      HERMES_OPS_UPTIME_FILE="${uptime_file:-/proc/uptime}" FAKE_UPTIME="$uptime_file" \
       FAKE_SBX="$dir" FAKE_CHECKOUT="$dir/checkout" \
       bash "$SCRIPT" "$@" >"$dir/stdout.txt" 2>"$dir/stderr.txt"
   echo $? >"$dir/status.txt"
@@ -577,6 +608,33 @@ test_update_success() {
 }
 
 
+test_check_seven_registered_profiles_with_deleted_remnant() {
+  new_sandbox check_seven_profiles
+  cat >"$SBX/fixtures/profile_list.txt" <<'EOF'
+ Profile     Model       Gateway   Alias   Distribution
+ ─────────   ─────────   ───────   ─────   ────────────
+ ◆default    model        running   —       —
+  ega-house-chief model  running   —       —
+  egahouse-pm model      running   —       —
+  mailling-radar model   running   —       —
+  me          model       running   —       —
+  t3-code-nighty-updates model running —       —
+  t3-work-status model   running   —       —
+  ega-house-chief1 model stopped —       deleted
+  WARN: profile listing degraded
+EOF
+  cat >"$SBX/fixtures/http_body.json" <<'EOF'
+{"version":"0.23.2","auth_required":true,"auth_providers":["basic"],"gateway_running":true,"overall":"ok","profiles":["default","ega-house-chief","egahouse-pm","mailling-radar","me","t3-code-nighty-updates","t3-work-status"],"components":{"dashboard":{"status":"ok"}}}
+EOF
+  run_script "$SBX" check
+  assert_eq "seven profiles exit" "0" "$(status_of "$SBX")"
+  assert_contains "seven profiles healthy" "STATUS: HEALTHY" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "seven profiles count" "Expected profiles: 7" "$report"
+  assert_not_contains "deleted remnant excluded" "ega-house-chief1" "$report"
+}
+
 test_update_wrong_revision_fails() {
   new_sandbox update_wrong_revision
   : >"$SBX/fixtures/wrong_revision"
@@ -608,6 +666,63 @@ test_update_profile_disappear_fails() {
   local report
   report=$(report_of "$SBX")
   assert_contains "profile disappear reported" "registered profile disappeared" "$report"
+}
+
+test_update_backend_delayed_recovery_succeeds() {
+  new_sandbox update_delayed_recovery
+  : >"$SBX/fixtures/delayed_backend_recovery"
+  echo "2" >"$SBX/fixtures/delayed_backend_fail_count"
+  run_script "$SBX" update
+  assert_eq "delayed recovery exit" "0" "$(status_of "$SBX")"
+  assert_contains "delayed recovery updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  assert_eq "delayed recovery one update" "1" "$(count_matches 'update --yes' "$SBX/calls.log")"
+  assert_eq "delayed recovery no restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
+}
+
+test_update_backend_readiness_timeout_fails() {
+  new_sandbox update_readiness_timeout
+  : >"$SBX/fixtures/delayed_backend_recovery"
+  echo "999" >"$SBX/fixtures/delayed_backend_fail_count"
+  : >"$SBX/fixtures/short_ready_budget"
+  : >"$SBX/fixtures/fake_clock"
+  run_script "$SBX" update
+  assert_eq "readiness timeout exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "readiness timeout not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "readiness timeout reported" "readiness budget" "$report"
+}
+
+test_update_advanced_wrong_revision_fails() {
+  new_sandbox update_advanced_wrong
+  : >"$SBX/fixtures/advance_wrong_revision"
+  run_script "$SBX" update
+  assert_eq "advanced wrong revision exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "advanced wrong revision not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "advanced wrong revision reported" "does not match selected stable revision" "$report"
+}
+
+test_update_correlated_receipt_survives_unrelated_latest() {
+  new_sandbox update_unrelated_latest
+  : >"$SBX/fixtures/unrelated_latest"
+  run_script "$SBX" update
+  assert_eq "unrelated latest exit" "0" "$(status_of "$SBX")"
+  assert_contains "unrelated latest updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+}
+
+test_update_backend_address_changed_fails() {
+  new_sandbox update_address_changed
+  : >"$SBX/fixtures/backend_wildcard_after"
+  : >"$SBX/fixtures/short_ready_budget"
+  : >"$SBX/fixtures/fake_clock"
+  run_script "$SBX" update
+  assert_eq "address changed exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "address changed not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "address changed reported" "listener ownership" "$report"
 }
 
 test_update_receipt_correlation_mismatch_fails() {
@@ -866,11 +981,17 @@ test_update_blocked_dirty
 test_update_blocked_migration
 test_update_blocked_sudo
 test_update_success
+test_check_seven_registered_profiles_with_deleted_remnant
 test_update_wrong_revision_fails
 test_update_stale_backend_fails
 test_update_profile_disappear_fails
 test_update_receipt_correlation_mismatch_fails
 test_update_gateway_stale_revision_fails
+test_update_backend_delayed_recovery_succeeds
+test_update_backend_readiness_timeout_fails
+test_update_advanced_wrong_revision_fails
+test_update_correlated_receipt_survives_unrelated_latest
+test_update_backend_address_changed_fails
 test_update_blocked_in_hermes_cgroup
 test_update_post_update_conflict_prevents_restarts
 test_update_respects_upstream_restart

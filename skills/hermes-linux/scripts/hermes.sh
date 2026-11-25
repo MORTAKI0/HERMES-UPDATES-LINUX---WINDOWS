@@ -75,6 +75,8 @@ INSTALL_KIND="unknown"
 CHANNEL="unknown"
 STABLE_TARGET="unknown"
 STABLE_TARGET_SHA="unknown"
+STABLE_TARGET_SHA_FULL="unknown"
+STABLE_TARGET_SHA_FULL_BEFORE="unknown"
 STABLE_TARGET_BEFORE="unknown"
 STABLE_TARGET_SHA_BEFORE="unknown"
 UPDATE_AVAILABLE="unknown"
@@ -122,6 +124,9 @@ PRE_SERVE_UNIT=""
 PRE_SERVE_SCOPE=""
 PRE_SERVE_USER=""
 PRE_SERVE_UNIT_EXISTS="unknown"
+PRE_BACKEND_URL=""
+PRE_LISTEN_ADDR=""
+PRE_LISTEN_PORT=""
 BACKEND_READY="unknown"
 LINGER="unknown"
 EXPECTED_PROFILES=""
@@ -650,6 +655,16 @@ unit_show() {
   systemctl_for "$scope" show "$unit" -p "$field" --value 2>/dev/null | head -n 1 || true
 }
 
+unit_show_timeout() {
+  local timeout_s="$1" scope="$2" unit="$3" field="$4"
+  [ "$timeout_s" -lt 1 ] && timeout_s=1
+  if [ "$scope" = user ]; then
+    timeout "$timeout_s" systemctl --user show "$unit" -p "$field" --value 2>/dev/null | head -n 1 || true
+  else
+    timeout "$timeout_s" systemctl show "$unit" -p "$field" --value 2>/dev/null | head -n 1 || true
+  fi
+}
+
 discover_unit_lists() {
   SYS_UNITS=$(systemctl list-unit-files --no-legend 'hermes*' 2>/dev/null | awk '{print $1}')
   if systemctl --user list-unit-files --no-legend 'hermes*' >/dev/null 2>&1; then
@@ -887,6 +902,7 @@ discover_profiles() {
         if (name == "Profile") next;
         if (NF < 3) next;
         if (name ~ /:$/) next;
+        if ($0 !~ /running|connected|stopped|inactive|parked|standalone|deleted/) next;
         if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
         if (tolower($0) ~ /deleted/) next;
         print name
@@ -897,6 +913,7 @@ discover_profiles() {
         if (name == "Profile") next;
         if (NF < 3) next;
         if (name ~ /:$/) next;
+        if ($0 !~ /running|connected|stopped|inactive|parked|standalone|deleted/) next;
         if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
         if (tolower($0) ~ /deleted/) next;
         if (tolower($0) ~ /parked/) next;
@@ -909,6 +926,7 @@ discover_profiles() {
         if (name == "Profile") next;
         if (NF < 3) next;
         if (name ~ /:$/) next;
+        if ($0 !~ /running|connected|stopped|inactive|parked|standalone|deleted/) next;
         if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
         if (tolower($0) ~ /deleted/) next;
         if (tolower($0) ~ /parked/) print name
@@ -919,6 +937,7 @@ discover_profiles() {
         if (name == "Profile") next;
         if (NF < 3) next;
         if (name ~ /:$/) next;
+        if ($0 !~ /running|connected|stopped|inactive|parked|standalone|deleted/) next;
         if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
         if (tolower($0) ~ /deleted/) next;
         if (tolower($0) ~ /standalone/) print name
@@ -1223,6 +1242,7 @@ discover_receipt() {
   fi
   local newest="" latest="$receipt_dir/latest.json" latest_kind=""
   newest=$(find "$receipt_dir" -maxdepth 1 -type f -name 'update_*.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)
+  local correlated_found="no"
   if [ -n "$UPDATE_CORRELATION_ID" ]; then
     local f cid
     while IFS= read -r f; do
@@ -1230,11 +1250,15 @@ discover_receipt() {
       cid=$(receipt_correlation_id "$f")
       if [ "$cid" = "$UPDATE_CORRELATION_ID" ]; then
         newest="$f"
+        correlated_found="yes"
         break
       fi
     done < <(find "$receipt_dir" -maxdepth 1 -type f -name 'update_*.json' 2>/dev/null)
+    if [ "$correlated_found" != yes ]; then
+      newest=""
+    fi
   fi
-  if [ -f "$latest" ]; then
+  if [ -f "$latest" ] && [ "$correlated_found" != yes ]; then
     latest_kind=$(python3 - "$latest" <<'PY' 2>/dev/null
 import json, sys
 try:
@@ -1383,6 +1407,13 @@ exec_signature() {
   printf '%s|%s' "$path" "$argv"
 }
 
+cgroup_has_unit() {
+  local cg="$1" unit="$2"
+  [ -n "$cg" ] && [ -n "$unit" ] || return 1
+  cg="${cg#*::}"
+  printf '%s\n' "$cg" | tr '/' '\n' | grep -Fxq "$unit"
+}
+
 check_update_execution_context() {
   local proc_root="${HERMES_OPS_PROC_ROOT:-/proc}"
   local ancestor=$$ cgroup parent
@@ -1404,11 +1435,11 @@ check_update_execution_context() {
       add_blocked PRECHECK "update was launched from the Hermes backend process; use an independent SSH or terminal session"
       return 1
     fi
-    if [ -n "$GATEWAY_UNIT" ] && printf '%s' "$cgroup" | grep -Fq "$GATEWAY_UNIT"; then
+    if [ -n "$GATEWAY_UNIT" ] && cgroup_has_unit "$cgroup" "$GATEWAY_UNIT"; then
       add_blocked PRECHECK "update was launched inside the gateway service cgroup; use an independent SSH or terminal session"
       return 1
     fi
-    if [ -n "$SERVE_UNIT" ] && printf '%s' "$cgroup" | grep -Fq "$SERVE_UNIT"; then
+    if [ -n "$SERVE_UNIT" ] && cgroup_has_unit "$cgroup" "$SERVE_UNIT"; then
       add_blocked PRECHECK "update was launched inside the backend service cgroup; use an independent SSH or terminal session"
       return 1
     fi
@@ -1422,6 +1453,18 @@ check_update_execution_context() {
   return 0
 }
 
+resolve_target_sha() {
+  local short="$1" full
+  [ -n "$short" ] && [ "$short" != unknown ] || return 1
+  full=$(git -C "$CHECKOUT" rev-parse --verify "${short}^{commit}" 2>/dev/null | head -n 1)
+  [ -n "$full" ] || return 1
+  case "$full" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "$full"
+}
+
 update_preflight() {
   local n=0
   check_update_execution_context || true
@@ -1433,6 +1476,12 @@ update_preflight() {
   if [ "$CHANNEL" != stable ]; then add_blocked PRECHECK "update channel is '$CHANNEL', not stable"; fi
   if [ "$UPDATE_AVAILABLE" = yes ] && { [ -z "$STABLE_TARGET" ] || [ "$STABLE_TARGET" = unknown ]; }; then add_blocked PRECHECK "stable target version could not be established"; fi
   if [ "$UPDATE_AVAILABLE" = yes ] && { [ -z "$STABLE_TARGET_SHA" ] || [ "$STABLE_TARGET_SHA" = unknown ]; }; then add_blocked PRECHECK "stable target revision could not be established"; fi
+  if [ "$UPDATE_AVAILABLE" = yes ]; then
+    STABLE_TARGET_SHA_FULL=$(resolve_target_sha "$STABLE_TARGET_SHA" 2>/dev/null || true)
+    if [ -z "$STABLE_TARGET_SHA_FULL" ] || [ "$STABLE_TARGET_SHA_FULL" = unknown ]; then
+      add_blocked PRECHECK "stable target revision could not be resolved to a unique full commit"
+    fi
+  fi
   if [ "$GIT_INTEGRITY_OK" != yes ]; then add_blocked PRECHECK "Git repository integrity could not be proven; refusing update"; fi
   if [ "$GIT_DIRTY" != no ]; then add_blocked PRECHECK "checkout cleanliness is '$GIT_DIRTY'; refusing to stash/reset/assume clean (see git status evidence)"; fi
   if [ "$CHECKOUT_OK" != yes ]; then add_blocked PRECHECK "checkout is on custom branch '$GIT_BRANCH'"; fi
@@ -1484,8 +1533,9 @@ poll_backend_ready() {
     [ -n "$now" ] || break
     remaining=$((budget - (now - start)))
     [ "$remaining" -le 0 ] && break
-    SERVE_ACTIVE=$(unit_show "$SERVE_SCOPE" "$SERVE_UNIT" ActiveState)
-    SERVE_PID=$(unit_show "$SERVE_SCOPE" "$SERVE_UNIT" MainPID)
+    READY_REMAINING="$remaining"
+    SERVE_ACTIVE=$(unit_show_timeout "$remaining" "$SERVE_SCOPE" "$SERVE_UNIT" ActiveState)
+    SERVE_PID=$(unit_show_timeout "$remaining" "$SERVE_SCOPE" "$SERVE_UNIT" MainPID)
     PROBE_TIMEOUT=$remaining
     [ "$PROBE_TIMEOUT" -gt 8 ] && PROBE_TIMEOUT=8
     [ "$PROBE_TIMEOUT" -lt 1 ] && PROBE_TIMEOUT=1
@@ -1572,12 +1622,16 @@ verify_gateway_runtime() {
 
 backend_listener_owned() {
   [ -n "$BACKEND_URL" ] && [ -n "$SERVE_PID" ] || return 1
-  local port line
+  local port addr line
   port=$(printf '%s' "$BACKEND_URL" | sed -n 's#.*:\([0-9][0-9]*\).*#\1#p')
   [ -n "$port" ] || return 1
   command -v ss >/dev/null 2>&1 || return 1
-  line=$(ss -ltnp 2>/dev/null | grep -F ":$port " | head -n 1 || true)
+  line=$(timeout "${READY_REMAINING:-2}" ss -ltnp 2>/dev/null | grep -F ":$port " | head -n 1 || true)
   [ -n "$line" ] || return 1
+  addr=$(printf '%s' "$line" | awk '{print $4}' | head -n 1)
+  if [ -n "$PRE_LISTEN_ADDR" ] && [ "$addr" != "$PRE_LISTEN_ADDR" ]; then
+    return 1
+  fi
   printf '%s' "$line" | grep -Fq "pid=$SERVE_PID,"
 }
 
@@ -1606,6 +1660,9 @@ verify_backend_runtime() {
   fi
   if [ -n "$BACKEND_URL" ] && ! backend_listener_owned; then
     add_degraded SERVE_BACKEND "backend listener ownership could not be verified for $BACKEND_URL"
+  fi
+  if [ -n "$PRE_BACKEND_URL" ] && [ "$BACKEND_URL" != "$PRE_BACKEND_URL" ]; then
+    add_degraded SERVE_BACKEND "backend endpoint changed after update: $PRE_BACKEND_URL -> ${BACKEND_URL:-none}"
   fi
 }
 
@@ -1659,11 +1716,9 @@ decide_update() {
       problems=$((problems + 1))
       add_degraded SOURCE_UPDATE "Git revision did not advance from $GIT_HEAD_BEFORE (after=${GIT_HEAD:-unknown})"
     fi
-    if [ "$STABLE_TARGET_SHA_BEFORE" != unknown ] && [ "$GIT_HEAD" != unknown ]; then
-      case "$GIT_HEAD" in
-        "$STABLE_TARGET_SHA_BEFORE"*) ;;
-        *) problems=$((problems + 1)); add_degraded SOURCE_UPDATE "installed Git revision $GIT_HEAD does not match selected stable revision $STABLE_TARGET_SHA_BEFORE" ;;
-      esac
+    if [ "$STABLE_TARGET_SHA_FULL_BEFORE" != unknown ] && [ "$GIT_HEAD" != unknown ] && [ "$GIT_HEAD" != "$STABLE_TARGET_SHA_FULL_BEFORE" ]; then
+      problems=$((problems + 1))
+      add_degraded SOURCE_UPDATE "installed Git revision $GIT_HEAD does not match selected stable revision $STABLE_TARGET_SHA_FULL_BEFORE"
     fi
     if [ -n "$UPDATE_CORRELATION_ID" ] && [ "$RECEIPT_CORRELATION" != "$UPDATE_CORRELATION_ID" ]; then
       problems=$((problems + 1))
@@ -1987,9 +2042,13 @@ main() {
   PRE_SERVE_SCOPE="$SERVE_SCOPE"
   PRE_SERVE_USER="$SERVE_USER"
   PRE_SERVE_UNIT_EXISTS="$SERVE_UNIT_EXISTS"
+  PRE_BACKEND_URL="$BACKEND_URL"
+  PRE_LISTEN_PORT=$(printf '%s' "$BACKEND_URL" | sed -n 's#.*:\([0-9][0-9]*\).*#\1#p')
+  PRE_LISTEN_ADDR=$(ss -ltnp 2>/dev/null | grep -F ":${PRE_LISTEN_PORT} " | awk '{print $4}' | head -n 1 || true)
   GIT_HEAD_BEFORE="$GIT_HEAD"
   STABLE_TARGET_BEFORE="$STABLE_TARGET"
   STABLE_TARGET_SHA_BEFORE="$STABLE_TARGET_SHA"
+  STABLE_TARGET_SHA_FULL_BEFORE="$STABLE_TARGET_SHA_FULL"
   REGISTERED_PROFILES_BEFORE="$REGISTERED_PROFILES"
   PARKED_PROFILES_BEFORE="$PARKED_PROFILES"
   STANDALONE_PROFILES_BEFORE="$STANDALONE_PROFILES"
@@ -2006,7 +2065,13 @@ main() {
   : >"$BLOCKED_FILE"
   : >"$DEGRADED_FILE"
   : >"$UNVERIFIED_FILE"
+  local post_update_quiet="no"
+  if [ "$UPDATE_NEEDED" = yes ] && [ "$UPDATE_EXIT" = "0" ] && [ -n "$BACKEND_URL" ]; then
+    post_update_quiet="yes"
+  fi
+  PROBE_QUIET="$post_update_quiet"
   collect_all "post-update"
+  PROBE_QUIET="no"
   if [ "$UPDATE_NEEDED" = yes ] && [ "$HERMES_VERSION" != unknown ]; then
     HERMES_VERSION_AFTER="$HERMES_VERSION"
   fi
