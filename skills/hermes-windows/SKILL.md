@@ -48,8 +48,19 @@ Optional:
 -AppInstallerFile <path>           # signed sideload descriptor, never guessed
 ```
 
+Backend URL precedence is: explicit `-BackendUrl`, then a pre-existing
+`HERMES_DESKTOP_REMOTE_URL`, then no URL (`UNKNOWN`). An explicitly supplied
+invalid URI, non-HTTP(S) URL, embedded userinfo, query or fragment is rejected;
+it is never replaced by the environment fallback. The report records which
+source was used and never prints credential userinfo.
+
 If local execution policy blocks scripts, report the blocker. Do not silently
 change machine execution policy.
+
+Native Hermes output is decoded as UTF-8 for each invocation, with the prior
+console output encoding restored afterward. Reports are written as UTF-8 so
+arrows, bullets and other valid Unicode are preserved in Windows PowerShell 5.1
+and PowerShell 7.
 
 ## Owner detection (mandatory, read-only)
 
@@ -57,16 +68,24 @@ The script inspects, at runtime:
 
 - `Get-Command hermes -All` and a source checkout at
   `%LOCALAPPDATA%\hermes\hermes-agent\.git`.
-- `Get-AppxPackage -Name 'NousResearch.HermesBundled'`, including
-  `SignatureKind`, `Publisher`, `Version`, and package identity.
+- Registered Hermes Appx packages, including `SignatureKind`, `Publisher`,
+  `Version`, and identity. The official identities are:
+  - Microsoft Store: `NousResearchInc.HermesAgent`, Store-signed, publisher
+    `CN=EE6D86E4-606F-4E38-B940-AD7248C9D519`.
+  - Sideload/bundled: `NousResearch.HermesBundled`, Developer/Enterprise-signed,
+    publisher `CN=Nous Research Inc.` (prefix).
 - `winget list --id 9PMXK8CZC7KR --exact --source msstore --upgrade-available`
   for Store-channel availability.
+
+Any other Hermes package identity, a signature/identity mismatch, or both
+official MSIX identities at once is blocked. The exact Store product ID remains
+`9PMXK8CZC7KR`.
 
 It then selects exactly one owner:
 
 | Detection | Owner | Allowed update |
 |---|---|---|
-| Only a verified source checkout/CLI | Source build | `hermes update --set-channel stable --yes` |
+| Only a verified source checkout/CLI | Source build | `hermes update --yes` |
 | Only a Store-signed MSIX | Microsoft Store | `winget upgrade --id 9PMXK8CZC7KR --exact --source msstore ...` |
 | Only a signed sideload MSIX with a verified descriptor | Sideload MSIX | `Add-AppxPackage -AppInstallerFile <verified descriptor>` |
 | Source + MSIX both present | Unknown | `BLOCKED` |
@@ -96,19 +115,46 @@ No package mutation, process kill, GUI launch, or saved-URL edit occurs.
 
 ## What `update` does
 
-- **Source:** preflight (`hermes update --plan`, clean checkout, stable channel,
-  no downgrade), one `hermes update --set-channel stable --yes`, independent
-  version/receipt checks, and a headless `hermes desktop --build-only
-  --force-build` **only** if output or receipt proves a missing/failed Desktop
-  build.
+- **Source:** preflight (`hermes update --plan`, resolved CLI install directory
+  matching the discovered checkout, official NousResearch Git remote, clean
+  tree, stable channel, no downgrade), exact installed and stable-target
+  identities (native install id plus full Git SHA, resolved locally or from the
+  verified official origin's release tag), one
+  `hermes update --yes`, independent exact version/revision/identity/receipt
+  checks, and a headless `hermes desktop --build-only --force-build` **only**
+  when the current operation's receipt/output proves a build is owed, the
+  native update completed successfully, and no Desktop process is holding the
+  build output.
 - **Store:** exact product ID `9PMXK8CZC7KR` with `--source msstore`, then
   re-reads `Get-AppxPackage`. `NO_APPLICABLE_UPGRADE` is its own outcome.
   Locked packages are reported with process evidence, never killed.
-- **Sideload:** only a publisher-verified `.appinstaller` whose identity,
-  publisher, HTTPS URI, and non-downgrade version all match the installed
-  package. An unreachable feed is `BLOCKED`; there is no fallback installer.
-- After any update, re-checks package/CLI version, source receipt follow-ups,
-  DNS/TCP/HTTP, and marks WebSocket `NOT_TESTED` unless truly exercised.
+- **Sideload:** only a publisher-verified `.appinstaller` whose `MainPackage`
+  or `MainBundle` identity, publisher, HTTPS URI, non-downgrade version, and
+  signed-sideload ownership all match. A missing descriptor is `UNKNOWN` in
+  check mode and blocks update; a rejected, ambiguous, or unreachable
+  descriptor is `BLOCKED`. There is no fallback installer.
+- After any package update, independently verifies the expected package is
+  still installed, its owner/identity/publisher are unchanged, and its version
+  is valid, non-downgraded, and satisfies the descriptor target where
+  applicable. Missing, ambiguous, invalid, or non-advancing packages are never
+  reported as success. It also re-checks source receipts, DNS/TCP/HTTP, and
+  marks WebSocket `NOT_TESTED` unless truly exercised.
+
+For source updates, the wrapper generates one operation correlation id and
+scopes it to the updater through `HERMES_UPDATE_CORRELATION_ID`, restoring any
+previous value afterward. Only the terminal `update_*.json` receipt whose
+`correlation_id` matches that operation is evidence for the update. A newer
+unrelated `latest.json`, a plugin-check artifact, a historical receipt, a
+malformed/incomplete schema, a failed outcome, unresolved `followups[]`, or
+`gateway_restart.incomplete=true` cannot produce `UPDATED`. Receipts are read
+only and never rewritten or deleted.
+
+`UPDATED` also requires the CLI version and full Git HEAD to equal the
+pre-update stable target, the install id and canonical checkout to be unchanged,
+official provenance and stable channel to remain valid, the checkout to remain
+clean, the Desktop artifact to be stamped at that exact commit, and the remote
+backend JSON health check to pass. HTTP 200 alone still does not prove
+authentication or WebSocket.
 
 ## Arguments and exit codes
 
@@ -145,7 +191,8 @@ or raw logs.
   authenticated WebSocket/session is `NOT_TESTED` unless a documented terminal
   credential path is supplied.
 - Sideload descriptor discovery is not standardized; without
-  `-AppInstallerFile` the script returns `BLOCKED` rather than guessing a feed.
+  `-AppInstallerFile` check reports `UNKNOWN` and update is `BLOCKED` rather
+  than guessing a feed.
 - WinGet output formats and exit codes are distributor/version dependent; the
   script records the raw bounded output for diagnosis.
 - The script cannot prove the Linux host state; run the Linux skill separately

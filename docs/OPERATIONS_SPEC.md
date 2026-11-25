@@ -70,7 +70,7 @@ The unit names above come from the intended deployment and **must be discovered*
 | Remote URL | port 9119, Tailscale IP or hostname | actual unit/config and Desktop connection setting |
 | Optional local model API | port 8642 | separate surface; do not treat as Desktop health |
 | Multiple profiles | more than one | `hermes profile list`, served-profile inventory |
-| Windows source/package owner | **unknown** | `Get-Command hermes -All`, `Get-AppxPackage`, WinGet, `hermes doctor` where valid |
+| Windows source/package owner | **unknown** | `Get-Command hermes -All`, Hermes Appx identities (`NousResearchInc.HermesAgent` Store, `NousResearch.HermesBundled` sideload), WinGet, `hermes doctor` where valid |
 
 **Never embed a real IP, API key, password, access token, or profile credentials in this repository.** Runtime URLs come from explicit arguments/environment or an existing verified configuration.
 
@@ -231,17 +231,19 @@ Stop **before any mutation** when:
 For a validated official source install, the primary command is:
 
 ```bash
-hermes update --set-channel stable --yes
+hermes update --yes
 ```
 
 This **both sets the channel and performs the update**. Do **not** run a second `hermes update`. Add `--no-backup` only if explicitly requested; otherwise keep Hermes' built-in quick snapshot. The upstream updater handles its own dependency preparation, gateway pause/restart, startup syntax guard, receipts, and internal rollback logic. Do not run `git pull`, `pip install`, `npm install`, or an external installer as a parallel or fallback update.
 
-### Refresh the separately managed Desktop backend
+### Service lifecycle and backend readiness
 
-The updater automatically manages gateway services it recognizes, but **does not own an independently launched `hermes serve`**. After the code update, restart **only** the **preflight-verified existing** backend service using its actual supervisor and permissions (e.g. `systemctl --user restart hermes-serve.service`, or `sudo systemctl restart ...` only with separately approved privileges).
+The updater owns gateway and backend lifecycle. The wrapper performs **no** automatic service restart, `systemctl restart`, or `hermes gateway restart`. After the update it verifies the installed release, Git revision, gateway state, expected/served profiles, native receipt, and backend readiness.
 
-- Preserve pre-update expected state: do **not** start a backend that was intentionally stopped, unless the operator explicitly requests it.
-- Restart the gateway manually **only if** verification shows it did not restart correctly; use Hermes' documented `hermes gateway restart` or the verified supervisor. Do not blindly restart an already healthy gateway a second time.
+- Hermes must have verified the channel is `stable` before the update command is issued.
+- The wrapper polls the backend `/api/status` endpoint with a bounded number of attempts and records whether it became ready.
+- A backend that was stopped before the update is not started by the wrapper.
+- Profile inventory uses registered profiles from `hermes profile list`; deleted profiles are excluded even if stale directories remain.
 - Do not run migrations, reconfigure authentication, change `ExecStart`, expose a new bind address, restart unrelated services, or reboot the VM.
 - If upstream updater fails, **do not immediately run another updater**. Diagnose code state and existing service condition first. If the backend is stale but reachable, report partial state rather than claiming recovery.
 
@@ -268,15 +270,27 @@ Read-only PowerShell evidence:
 
 ```powershell
 Get-Command hermes -All -ErrorAction SilentlyContinue
-Get-AppxPackage -Name 'NousResearch.HermesBundled'
+Get-AppxPackage | Where-Object { $_.Name -match 'Hermes' }
 winget list --id 9PMXK8CZC7KR --exact --source msstore
 ```
 
-For source installs, also verify `%LOCALAPPDATA%\hermes\hermes-agent\.git`, selected CLI provenance, and `hermes doctor` where available. A source/bootstrap installer (`Hermes-Setup.exe` / official `install.ps1`) is **not** an MSIX just because it runs a Desktop executable.
+The official Store identity is `NousResearchInc.HermesAgent` (Store-signed,
+publisher `CN=EE6D86E4-606F-4E38-B940-AD7248C9D519`). The official out-of-store
+sideload identity is `NousResearch.HermesBundled` (Developer/Enterprise-signed,
+publisher `CN=Nous Research Inc.`). Any other Hermes identity, a signature or
+publisher mismatch, or both official variants at once is ambiguous and must be
+blocked.
+
+For source installs, also verify `%LOCALAPPDATA%\hermes\hermes-agent\.git`, that
+the resolved CLI reports that same install directory with `Install method: git`,
+the official NousResearch Git remote, a clean tree, the stable channel, and
+`hermes doctor` where available. A source/bootstrap installer (`Hermes-Setup.exe`
+/ official `install.ps1`) is **not** an MSIX just because it runs a Desktop
+executable.
 
 | Detection | Correct owner | Allowed update |
 |---|---|---|
-| Verified source-built Desktop, no competing package ambiguity | Hermes CLI | `hermes update --set-channel stable --yes` |
+| Verified source-built Desktop, no competing package ambiguity | Hermes CLI | `hermes update --yes` |
 | Verified Microsoft Store app | Microsoft Store | `winget upgrade --id 9PMXK8CZC7KR --exact --source msstore ...` |
 | Verified signed sideload MSIX/App Installer | Registered Windows App Installer feed | `Add-AppxPackage -AppInstallerFile <verified official descriptor>` |
 | Both Store/MSIX and source build exist, active Desktop owner unclear | Unknown | **BLOCKED** |
@@ -294,7 +308,7 @@ For source installs, also verify `%LOCALAPPDATA%\hermes\hermes-agent\.git`, sele
 3. Determine update availability using the **right owner**, without changing package state:
    - source → `hermes update --check`;
    - Store → `winget list/upgrade --available` with exact product/source filtering; WinGet may return “no applicable upgrade,” which can mean *already current in the Store channel* or *not offered here* — do not equate with GitHub stable;
-   - sideload → only read the registered/publisher-verified official descriptor; if unreachable, `UNKNOWN` not current.
+   - sideload → only read and validate the registered/publisher-verified official descriptor; missing descriptor is `UNKNOWN`, rejected descriptor or unavailable feed is `BLOCKED`, never current-by-assumption.
 4. Validate explicit/verified Linux backend URL (`HERMES_DESKTOP_REMOTE_URL` can override saved Desktop selection). Avoid logging the Desktop's saved authentication credentials.
 5. Check network/Tailscale if available, then `GET /api/status`. Classify **TCP reachable / Hermes JSON / auth advertised** separately.
 6. If existing approved credentials and a documented terminal-capable WebSocket test path are available, test the authenticated `/api/ws` handshake and record success; **never scrape/decrypt saved Desktop tokens just to claim full health**. Without this proof mark WebSocket/session `NOT_TESTED`.
@@ -314,16 +328,20 @@ For source installs, also verify `%LOCALAPPDATA%\hermes\hermes-agent\.git`, sele
 
 ```powershell
 hermes update --plan
-hermes update --set-channel stable --yes
+hermes update --yes
 ```
 
-Add `--no-backup` only if explicitly selected. Check `$LASTEXITCODE` after **every** external command. The source updater can rebuild Desktop as part of its own pipeline. Use the terminal-only repair:
+Add `--no-backup` only if explicitly selected. Check `$LASTEXITCODE` after **every** external command. Before mutation, resolve the selected stable target to one full Git commit and capture the native install id, installed version, full Git HEAD, canonical checkout, official provenance and stable channel. Resolve the full target locally when the release object exists; otherwise resolve the immutable release tag from the already-verified official origin with `git ls-remote`, requiring the returned full SHA to match the native short SHA. If any target/revision identity is ambiguous, **BLOCKED** before invoking the updater. After mutation, require the CLI version and full Git HEAD to equal that exact target, and the install id, checkout, provenance, channel, integrity and cleanliness to remain unchanged; version advancement alone is not success.
+
+For every attempted source update, generate one operation correlation id and scope it to the updater with `HERMES_UPDATE_CORRELATION_ID`, restoring any prior value afterward. Select only the terminal `update_*.json` receipt whose `correlation_id` matches this operation. A newer unrelated `latest.json`, a plugin-check artifact, a historical receipt, malformed/incomplete schema, failed outcome, unresolved `followups[]`, or `gateway_restart.incomplete=true` is non-success. Do not rewrite or delete native receipts.
+
+The source updater can rebuild Desktop as part of its own pipeline. Use the terminal-only repair:
 
 ```powershell
 hermes desktop --build-only --force-build
 ```
 
-**only if** upstream output/receipt indicates a missing or failed Desktop build, and the source app is no longer holding the build output files. This option builds without launching Desktop. Do not run `hermes desktop` alone, which can open the GUI. Inspect native receipt `followups` and `desktop` build result.
+**only if** the current operation's output/receipt proves a missing or failed Desktop build, the native update completed successfully, and the source app is no longer holding the build output files. This option builds without launching Desktop. Do not run `hermes desktop` alone, which can open the GUI. Historical receipt state cannot authorize a new repair. Independently verify the packaged artifact's install stamp names the exact target commit; otherwise Desktop remains `unverified`/`failed` and the update is not `UPDATED`.
 
 ### B. Microsoft Store Desktop
 
@@ -337,7 +355,7 @@ Re-read `Get-AppxPackage` and the Store upgrade listing. Handle WinGet's `NO_APP
 
 ### C. Sideload MSIX Desktop
 
-1. Discover the actual registered App Installer source / official publisher feed. Verify **HTTPS host**, package identity, package version, and Microsoft-trusted signature through Windows package validation.
+1. Discover the actual registered App Installer source / official publisher feed. Accept a descriptor with exactly one official `MainPackage` or `MainBundle`; reject both/neither. Verify **HTTPS host**, official sideload identity `NousResearch.HermesBundled`, publisher matching the installed Nous Research package, package version, non-downgrade, and Microsoft-trusted signature through Windows package validation. A missing descriptor is `UNKNOWN` in check mode and blocks update; a rejected or ambiguous descriptor is `BLOCKED`.
 2. Only if the official signed `.appinstaller` descriptor is reachable and proposes a non-downgrade, use Windows `Add-AppxPackage -AppInstallerFile` through PowerShell.
 3. Validate installed package version afterward; if the publisher feed is unavailable, **BLOCKED**, with the failed URL/HTTP or transport error and no fallback source build.
 
@@ -346,10 +364,11 @@ Re-read `Get-AppxPackage` and the Store upgrade listing. Handle WinGet's `NO_APP
 ### Post-update Windows checks
 
 - Package/CLI version before/after and distributor-specific “current” status.
-- When source-built, native Hermes diagnostics + latest receipt with no required follow-ups.
+- For Store/sideload updates, verify exactly one supported package remains installed with the expected identity, publisher, and ownership; the version must be valid, non-downgraded, advanced when required, and at least the validated sideload descriptor target. Missing, ambiguous, invalid, or unchanged packages are non-success.
+- When source-built, native Hermes diagnostics plus the **current operation's correlated receipt**, never an unrelated newer `latest.json`, with no required follow-ups. Keep these verdicts separate: Windows source installation updated; Desktop build verified or unverified; remote backend reachable; remote backend healthy (`overall=ok`); authentication advertised; authenticated Desktop session actually tested; WebSocket actually tested.
 - No unwanted Desktop GUI launch.
 - Remote URL host resolves and the VM HTTP endpoint responds with Hermes JSON.
-- Authenticated WebSocket **only if truly tested**; HTTP-only success is not “Desktop connected.”
+- Authenticated WebSocket **only if truly tested**; HTTP-only success is not “Desktop connected.” Never require Windows and Linux versions to match unless upstream states that compatibility constraint.
 
 ---
 
@@ -472,8 +491,8 @@ All values in this example are **hypothetical**. Reports must always use actual 
 - [ ] `bash -n` passes; behavior tested with mocked `hermes`, `systemctl`, `curl` and a temporary fake receipt.
 - [ ] `check` does not call update/apply, service restart, migration apply or config setter.
 - [ ] Fails closed on wrong UNIX user, missing source, conflicting user/system units, dirty checkout, older stable target, migration plan requiring consent.
-- [ ] Uses `hermes update --set-channel stable --yes` only once, no unrequested `--no-backup`.
-- [ ] Native gateway restart respected; separately supervised `hermes-serve` refreshed and PID verified when applicable.
+- [ ] Uses `hermes update --yes` only once, after verifying the stable channel, no unrequested `--no-backup`.
+- [ ] Verifies installed release, Git revision, expected/served profiles, backend readiness, and native receipt follow-ups.
 - [ ] Receipt with `outcome=success` **and a followup** produces `PARTIAL`, not `UPDATED`.
 - [ ] HTTP 200 wrong content is not a success; HTTP 401 is not an authenticated session success.
 - [ ] Relevant service failure includes redacted journal evidence and exact remediation guidance.
@@ -482,12 +501,20 @@ All values in this example are **hypothetical**. Reports must always use actual 
 
 - [ ] Parses in Windows PowerShell 5.1; real execution tested on Windows 11, not Linux-only static inspection.
 - [ ] Source, Store, sideload, ambiguous dual install, and unknown owner branches each tested.
-- [ ] Verifies package identity; never uses source CLI to update MSIX; never silently migrates owner.
+- [ ] Verifies Store identity `NousResearchInc.HermesAgent` and sideload identity `NousResearch.HermesBundled`; blocks unknown/dual identities; never uses source CLI to update MSIX; never silently migrates owner.
 - [ ] Checks `$LASTEXITCODE` on native commands; handles WinGet “no applicable upgrade” truthfully.
 - [ ] Official sideload source unreachable produces `BLOCKED` without fallback.
 - [ ] Running GUI lock results in targeted diagnosis, not blanket process termination.
 - [ ] No GUI opened; source Desktop rebuild is headless and conditional.
 - [ ] Tailscale/network/HTTP/WS status each reported separately.
+- [ ] Source update resolves the selected stable version to one full target commit before mutation; unresolved/ambiguous target blocks.
+- [ ] Post-update version and full Git revision must both equal the pre-update target; unchanged or wrong version/revision is non-success.
+- [ ] Installation id, canonical checkout, official provenance, stable channel and checkout cleanliness are re-verified after mutation.
+- [ ] Each source update carries a unique `HERMES_UPDATE_CORRELATION_ID`; only the matching terminal receipt is current evidence.
+- [ ] Correlated receipt survives a newer unrelated `latest.json`; missing/mismatched/historical/plugin/malformed/failed receipts are non-success.
+- [ ] Receipt follow-ups or `gateway_restart.incomplete=true` are `PARTIAL`, never `UPDATED`.
+- [ ] Desktop repair runs only from current-operation evidence after a successful native update, and never while a process holds build output.
+- [ ] Desktop build, backend reachable/healthy, auth advertised, authenticated session and WebSocket remain distinct outcomes.
 
 ### E2E checks on the user's real deployment (required)
 
@@ -552,6 +579,7 @@ No PR/branch management, UI, dashboard, multi-host remote execution, extra depen
 7. Hermes official latest stable release: https://github.com/NousResearch/hermes-agent/releases/latest
 8. Microsoft — WinGet upgrade: https://learn.microsoft.com/en-us/windows/package-manager/winget/upgrade
 9. Microsoft — Add-AppxPackage: https://learn.microsoft.com/en-us/powershell/module/appx/add-appxpackage
+10. Hermes Desktop product identity (Store vs sideload MSIX): https://github.com/NousResearch/hermes-agent/blob/main/apps/desktop/product-identity.cjs
 
 **Freshness rule:** inspect the current official docs and `hermes update --help` on the installed version before relying on an argument that may have changed. Do not silently use `main` or canary because a public doc becomes inconsistent. If docs and installed commands disagree, record both, stop before potentially destructive actions, and propose a safe compatibility path.
 
