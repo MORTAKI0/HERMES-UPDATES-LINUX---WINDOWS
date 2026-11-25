@@ -146,7 +146,7 @@ binding, blocked update (dirty/migration/sudo), successful update (one updater
 call, backend PID refresh), upstream restart respect, stale gateway refresh,
 partial receipt, updater failure with no retry, already-current, argument
 rejection, provenance failures, unverified health states, post-update restart
-safety, and redaction. Current result: **144 assertions passed**.
+safety, and redaction. Current result: **165 assertions passed**.
 
 Windows (must run on a Windows host):
 

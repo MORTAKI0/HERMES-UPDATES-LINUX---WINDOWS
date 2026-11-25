@@ -127,6 +127,7 @@ PRE_SERVE_UNIT_EXISTS="unknown"
 PRE_BACKEND_URL=""
 PRE_LISTEN_ADDR=""
 PRE_LISTEN_PORT=""
+POST_UPDATE_READINESS="no"
 BACKEND_READY="unknown"
 LINGER="unknown"
 EXPECTED_PROFILES=""
@@ -808,15 +809,28 @@ discover_units() {
     if [ -z "$SERVE_USER" ] && [ "$SERVE_SCOPE" = user ]; then SERVE_USER="$EFFECTIVE_USER"; fi
     [ -n "$SERVE_USER" ] || SERVE_USER="root (systemd default)"
     local serve_verdict="NOT_TESTED"
+    local backend_transient="no"
+    if [ "$POST_UPDATE_READINESS" = yes ]; then
+      case "$SERVE_ACTIVE" in
+        activating|reloading) backend_transient="yes" ;;
+      esac
+      if [ "$SERVE_ACTIVE" = active ] && { [ -z "$SERVE_PID" ] || [ "$SERVE_PID" = "0" ] || [ "$SERVE_PID" = "unknown" ]; }; then
+        backend_transient="yes"
+      fi
+    fi
     if [ "$SERVE_ACTIVE" = active ] && [ -n "$SERVE_PID" ] && [ "$SERVE_PID" != "0" ] && [ "$SERVE_PID" != "unknown" ]; then
       serve_verdict="PASS"
+    elif [ "$backend_transient" = yes ]; then
+      serve_verdict="NOT_TESTED"
     elif [ "$SERVE_ACTIVE" = active ] || [ "$SERVE_ACTIVE" = inactive ]; then
       serve_verdict="FAIL"
     fi
     record_check_row "Desktop backend service" "active/running" \
       "$SERVE_UNIT ($SERVE_SCOPE) $SERVE_ACTIVE/$SERVE_SUBSTATE pid=${SERVE_PID:-none} user=$SERVE_USER" \
       "$serve_verdict"
-    if [ "$SERVE_ACTIVE" != active ]; then
+    if [ "$backend_transient" = yes ]; then
+      record_timeline "POST_UPDATE" "backend transient state" "observation" "$SERVE_ACTIVE/$SERVE_SUBSTATE pid=${SERVE_PID:-none}; readiness polling owns final verdict"
+    elif [ "$SERVE_ACTIVE" != active ]; then
       add_degraded SERVE_BACKEND "Desktop backend unit $SERVE_UNIT is ${SERVE_ACTIVE:-unknown}/${SERVE_SUBSTATE:-unknown}"
     elif [ -z "$SERVE_PID" ] || [ "$SERVE_PID" = "0" ] || [ "$SERVE_PID" = "unknown" ]; then
       add_degraded SERVE_BACKEND "Desktop backend unit $SERVE_UNIT is active but its MainPID is unavailable"
@@ -1538,32 +1552,78 @@ monotonic_now() {
 }
 
 poll_backend_ready() {
-  local start now remaining sleep_s budget="${HERMES_OPS_READY_BUDGET:-90}"
+  local start now remaining sleep_s budget deadline
+  budget="${HERMES_OPS_READY_BUDGET:-90}"
   start=$(monotonic_now)
-  [ -n "$start" ] || { add_degraded SERVE_BACKEND "monotonic clock unavailable for readiness polling"; return 1; }
+  if [ -z "$start" ]; then
+    add_degraded SERVE_BACKEND "monotonic clock unavailable for readiness polling"
+    return 1
+  fi
+  deadline=$((start + budget))
   BACKEND_READY="no"
   while :; do
     now=$(monotonic_now)
-    [ -n "$now" ] || break
-    remaining=$((budget - (now - start)))
+    if [ -z "$now" ]; then
+      add_degraded SERVE_BACKEND "monotonic clock became unavailable during readiness polling"
+      return 1
+    fi
+    remaining=$((deadline - now))
     [ "$remaining" -le 0 ] && break
-    READY_REMAINING="$remaining"
+
     SERVE_ACTIVE=$(unit_show_timeout "$remaining" "$SERVE_SCOPE" "$SERVE_UNIT" ActiveState)
+    now=$(monotonic_now)
+    if [ -z "$now" ]; then
+      add_degraded SERVE_BACKEND "monotonic clock became unavailable during readiness polling"
+      return 1
+    fi
+    remaining=$((deadline - now))
+    [ "$remaining" -le 0 ] && break
+
     SERVE_PID=$(unit_show_timeout "$remaining" "$SERVE_SCOPE" "$SERVE_UNIT" MainPID)
+    now=$(monotonic_now)
+    if [ -z "$now" ]; then
+      add_degraded SERVE_BACKEND "monotonic clock became unavailable during readiness polling"
+      return 1
+    fi
+    remaining=$((deadline - now))
+    [ "$remaining" -le 0 ] && break
+
+    READY_REMAINING="$remaining"
+    PROBE_QUIET=yes
+    discover_backend_url
+    now=$(monotonic_now)
+    if [ -z "$now" ]; then
+      PROBE_QUIET="no"
+      add_degraded SERVE_BACKEND "monotonic clock became unavailable during readiness polling"
+      return 1
+    fi
+    remaining=$((deadline - now))
+    if [ "$remaining" -le 0 ]; then
+      PROBE_QUIET="no"
+      break
+    fi
+    READY_REMAINING="$remaining"
     PROBE_TIMEOUT=$remaining
     [ "$PROBE_TIMEOUT" -gt 8 ] && PROBE_TIMEOUT=8
     [ "$PROBE_TIMEOUT" -lt 1 ] && PROBE_TIMEOUT=1
-    PROBE_QUIET=yes
-    discover_backend_url
     probe_backend
-    PROBE_QUIET=no
+    PROBE_QUIET="no"
+
     if [ "$HTTP_CHECK" = PASS ] && [ "$HTTP_VERSION" = "$HERMES_VERSION" ] && [ "$HTTP_OVERALL" = ok ] && backend_listener_owned; then
-      BACKEND_READY="yes"
-      return 0
+      now=$(monotonic_now)
+      if [ -n "$now" ] && [ "$((deadline - now))" -gt 0 ]; then
+        BACKEND_READY="yes"
+        return 0
+      fi
+      break
     fi
+
     now=$(monotonic_now)
-    [ -n "$now" ] || break
-    remaining=$((budget - (now - start)))
+    if [ -z "$now" ]; then
+      add_degraded SERVE_BACKEND "monotonic clock became unavailable during readiness polling"
+      return 1
+    fi
+    remaining=$((deadline - now))
     [ "$remaining" -le 1 ] && break
     sleep_s=2
     [ "$sleep_s" -gt "$remaining" ] && sleep_s=$remaining
@@ -2088,8 +2148,10 @@ main() {
     post_update_quiet="yes"
   fi
   PROBE_QUIET="$post_update_quiet"
+  POST_UPDATE_READINESS="$post_update_quiet"
   collect_all "post-update"
   PROBE_QUIET="no"
+  POST_UPDATE_READINESS="no"
   if [ "$UPDATE_NEEDED" = yes ] && [ "$HERMES_VERSION" != unknown ]; then
     HERMES_VERSION_AFTER="$HERMES_VERSION"
   fi

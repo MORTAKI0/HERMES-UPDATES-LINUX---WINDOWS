@@ -300,6 +300,21 @@ case "$cmd" in
         ;;
       *) pid=0; desc="unknown"; exec="{ path=/bin/false ; argv[]=/bin/false ; }" ;;
     esac
+    if [ "$unit" = "hermes-serve.service" ] && grep -q 'v0.23.3' "$fixtures/version.txt" 2>/dev/null; then
+      if [ -f "$fixtures/backend_activating_after" ] || [ -f "$fixtures/backend_no_pid_after" ]; then
+        count=$(( $(cat "$FAKE_SBX/state/serve_show_count" 2>/dev/null || echo 0) + 1 ))
+        echo "$count" >"$FAKE_SBX/state/serve_show_count"
+        limit=$(cat "$fixtures/backend_transient_count" 2>/dev/null || echo 5)
+        if [ "$count" -le "$limit" ]; then
+          if [ -f "$fixtures/backend_activating_after" ]; then active=activating; pid=0; fi
+          if [ -f "$fixtures/backend_no_pid_after" ]; then active=active; pid=0; fi
+        fi
+      fi
+    fi
+    if [ -n "${FAKE_UPTIME:-}" ] && [ -f "$fixtures/slow_service_inspection" ]; then
+      cur=$(cat "$FAKE_UPTIME" 2>/dev/null || echo 0)
+      echo $(( cur + ${SLOW_SERVICE_SECONDS:-80} )) >"$FAKE_UPTIME"
+    fi
     if [ "$active" = inactive ]; then pid=0; fi
     case "$field" in
       ActiveState) echo "$active" ;;
@@ -377,6 +392,10 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 if [ -f "$FAKE_SBX/fixtures/http_network_fail" ]; then exit 7; fi
+if [ -f "$FAKE_SBX/fixtures/slow_http_probe" ] && [ -n "${FAKE_UPTIME:-}" ]; then
+  cur=$(cat "$FAKE_UPTIME" 2>/dev/null || echo 0)
+  echo $(( cur + ${SLOW_HTTP_SECONDS:-100} )) >"$FAKE_UPTIME"
+fi
 if [ -f "$FAKE_SBX/fixtures/delayed_backend_recovery" ]; then
   count=$(( $(cat "$FAKE_SBX/state/curl_count" 2>/dev/null || echo 0) + 1 ))
   echo "$count" >"$FAKE_SBX/state/curl_count"
@@ -451,6 +470,9 @@ run_script() {
   if [ -f "$dir/fixtures/fake_clock" ]; then
     uptime_file="$dir/state/uptime"
     echo "1000" >"$uptime_file"
+  fi
+  if [ -f "$dir/fixtures/clock_unavailable" ]; then
+    uptime_file="$dir/state/missing-uptime"
   fi
   env PATH="$dir/bin:/usr/bin:/bin" HOME="$dir/home" \
       HERMES_HOME="$dir/home/.hermes" HERMES_OPS_REPORT_DIR="$dir/reports" \
@@ -842,6 +864,84 @@ test_update_similar_unrelated_cgroup_allowed() {
   assert_not_contains "similar cgroup not blocked for cgroup" "inside the gateway service cgroup" "$SBX/stdout.txt"
 }
 
+test_update_backend_activating_recovers() {
+  new_sandbox update_activating_recovers
+  : >"$SBX/fixtures/backend_activating_after"
+  echo "5" >"$SBX/fixtures/backend_transient_count"
+  run_script "$SBX" update
+  assert_eq "activating recovery exit" "0" "$(status_of "$SBX")"
+  assert_contains "activating recovery updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  assert_eq "activating recovery one update" "1" "$(count_matches 'update --yes' "$SBX/calls.log")"
+  assert_eq "activating recovery no restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
+}
+
+test_update_backend_missing_pid_recovers() {
+  new_sandbox update_missing_pid_recovers
+  : >"$SBX/fixtures/backend_no_pid_after"
+  echo "5" >"$SBX/fixtures/backend_transient_count"
+  run_script "$SBX" update
+  assert_eq "missing pid recovery exit" "0" "$(status_of "$SBX")"
+  assert_contains "missing pid recovery updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  assert_eq "missing pid recovery one update" "1" "$(count_matches 'update --yes' "$SBX/calls.log")"
+  assert_eq "missing pid recovery no restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
+}
+
+test_update_backend_permanently_activating_fails() {
+  new_sandbox update_permanent_activating
+  : >"$SBX/fixtures/backend_activating_after"
+  echo "9999" >"$SBX/fixtures/backend_transient_count"
+  : >"$SBX/fixtures/short_ready_budget"
+  : >"$SBX/fixtures/fake_clock"
+  run_script "$SBX" update
+  assert_eq "permanent activating exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "permanent activating not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "permanent activating reported" "readiness budget" "$report"
+}
+
+test_update_backend_recovered_with_unrelated_receipt_failure() {
+  new_sandbox update_recovered_receipt_fail
+  : >"$SBX/fixtures/backend_activating_after"
+  echo "5" >"$SBX/fixtures/backend_transient_count"
+  : >"$SBX/fixtures/receipt_followup_after"
+  run_script "$SBX" update
+  assert_eq "recovered receipt failure exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "recovered receipt failure not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "recovered receipt failure reported" "unresolved follow-up" "$report"
+}
+
+test_update_readiness_service_inspection_budget() {
+  new_sandbox update_slow_service_budget
+  : >"$SBX/fixtures/slow_service_inspection"
+  : >"$SBX/fixtures/fake_clock"
+  run_script "$SBX" update
+  assert_eq "slow service budget exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "slow service budget not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+}
+
+test_update_readiness_http_exceeds_budget() {
+  new_sandbox update_slow_http_budget
+  : >"$SBX/fixtures/slow_http_probe"
+  : >"$SBX/fixtures/fake_clock"
+  run_script "$SBX" update
+  assert_eq "slow http budget exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "slow http budget not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+}
+
+test_update_readiness_clock_unavailable() {
+  new_sandbox update_clock_unavailable
+  : >"$SBX/fixtures/clock_unavailable"
+  run_script "$SBX" update
+  assert_eq "clock unavailable exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "clock unavailable not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "clock unavailable reported" "monotonic clock unavailable" "$report"
+}
+
 test_update_post_update_conflict_prevents_restarts() {
   new_sandbox update_post_conflict
   : >"$SBX/fixtures/post_update_conflict"
@@ -1059,6 +1159,13 @@ test_update_receipt_correlation_mismatch_fails
 test_update_gateway_stale_revision_fails
 test_update_backend_delayed_recovery_succeeds
 test_update_backend_readiness_timeout_fails
+test_update_backend_activating_recovers
+test_update_backend_missing_pid_recovers
+test_update_backend_permanently_activating_fails
+test_update_backend_recovered_with_unrelated_receipt_failure
+test_update_readiness_service_inspection_budget
+test_update_readiness_http_exceeds_budget
+test_update_readiness_clock_unavailable
 test_update_advanced_wrong_revision_fails
 test_update_correlated_receipt_survives_unrelated_latest
 test_update_backend_address_changed_fails
