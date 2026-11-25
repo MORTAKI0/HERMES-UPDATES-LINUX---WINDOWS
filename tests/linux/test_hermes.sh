@@ -186,6 +186,9 @@ case "${1:-}" in
         if [ ! -f "$fixtures/stale_backend_after" ]; then
           sed -i 's/"version":"0.23.2"/"version":"0.23.3"/' "$fixtures/http_body.json"
         fi
+        if [ -f "$fixtures/standalone_stops_after" ]; then
+          sed -i '/standalone/ s/running/stopped/' "$fixtures/profile_list.txt"
+        fi
         if [ -f "$fixtures/profile_disappear_after" ]; then
           grep -v 'alpha' "$fixtures/profile_list.txt" >"$fixtures/profile_list.tmp" && mv "$fixtures/profile_list.tmp" "$fixtures/profile_list.txt"
         fi
@@ -635,6 +638,25 @@ EOF
   assert_not_contains "deleted remnant excluded" "ega-house-chief1" "$report"
 }
 
+test_update_standalone_profile_runtime_lost_fails() {
+  new_sandbox update_standalone_lost
+  cat >"$SBX/fixtures/profile_list.txt" <<'EOF'
+ Profile     Model       Gateway   Alias   Distribution
+ ─────────   ─────────   ───────   ─────   ────────────
+ ◆default    model        running   —       —
+  alpha      model        running   alpha   —
+  beta       model        running   beta    —
+  solo       model        running   —       standalone
+EOF
+  : >"$SBX/fixtures/standalone_stops_after"
+  run_script "$SBX" update
+  assert_eq "standalone lost exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "standalone lost not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "standalone lost reported" "standalone profile runtime state changed" "$report"
+}
+
 test_update_wrong_revision_fails() {
   new_sandbox update_wrong_revision
   : >"$SBX/fixtures/wrong_revision"
@@ -982,6 +1004,7 @@ test_update_blocked_migration
 test_update_blocked_sudo
 test_update_success
 test_check_seven_registered_profiles_with_deleted_remnant
+test_update_standalone_profile_runtime_lost_fails
 test_update_wrong_revision_fails
 test_update_stale_backend_fails
 test_update_profile_disappear_fails

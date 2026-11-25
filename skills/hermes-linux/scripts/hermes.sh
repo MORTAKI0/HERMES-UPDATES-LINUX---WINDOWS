@@ -134,10 +134,12 @@ EXPECTED_PROFILE_COUNT="unknown"
 REGISTERED_PROFILES=""
 PARKED_PROFILES=""
 STANDALONE_PROFILES=""
+STANDALONE_RUNNING=""
 EXPECTED_SERVED_PROFILES=""
 REGISTERED_PROFILES_BEFORE=""
 PARKED_PROFILES_BEFORE=""
 STANDALONE_PROFILES_BEFORE=""
+STANDALONE_RUNNING_BEFORE=""
 SERVED_PROFILES=""
 SERVED_PROFILE_COUNT="unknown"
 MISSING_PROFILES=""
@@ -894,7 +896,7 @@ discover_profiles() {
 
   capture 90 "$HERMES_BIN" profile list
   PROFILE_LIST_STATUS="exit $RUN_STATUS"
-  local registered="" served="" parked="" standalone=""
+  local registered="" served="" parked="" standalone="" standalone_running=""
   if [ "$RUN_STATUS" -eq 0 ]; then
     registered=$(printf '%s\n' "$RUN_OUTPUT" | awk '
       /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
@@ -942,10 +944,22 @@ discover_profiles() {
         if (tolower($0) ~ /deleted/) next;
         if (tolower($0) ~ /standalone/) print name
       }' | sort -u | tr '\n' ',' | sed 's/,$//')
+    standalone_running=$(printf '%s\n' "$RUN_OUTPUT" | awk '
+      /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
+        name=$1; sub(/^[◆*]+/, "", name);
+        if (name == "Profile") next;
+        if (NF < 3) next;
+        if (name ~ /:$/) next;
+        if ($0 !~ /running|connected|stopped|inactive|parked|standalone|deleted/) next;
+        if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
+        if (tolower($0) ~ /deleted/) next;
+        if (tolower($0) ~ /standalone/ && $0 ~ /running|connected/) print name
+      }' | sort -u | tr '\n' ',' | sed 's/,$//')
   fi
   REGISTERED_PROFILES="$registered"
   PARKED_PROFILES="$parked"
   STANDALONE_PROFILES="$standalone"
+  STANDALONE_RUNNING="$standalone_running"
   EXPECTED_SERVED_PROFILES="$registered"
   if [ -n "$parked" ]; then
     for p in $(printf '%s' "$parked" | tr ',' ' '); do
@@ -1689,6 +1703,9 @@ verify_profile_inventory() {
   if [ "$STANDALONE_PROFILES" != "$STANDALONE_PROFILES_BEFORE" ]; then
     add_degraded GATEWAY "standalone profile state changed after update"
   fi
+  if [ "$STANDALONE_RUNNING" != "$STANDALONE_RUNNING_BEFORE" ]; then
+    add_degraded GATEWAY "standalone profile runtime state changed after update"
+  fi
   if [ -n "$MISSING_PROFILES" ]; then
     add_degraded GATEWAY "expected profile(s) not served after update: $MISSING_PROFILES"
   fi
@@ -2052,6 +2069,7 @@ main() {
   REGISTERED_PROFILES_BEFORE="$REGISTERED_PROFILES"
   PARKED_PROFILES_BEFORE="$PARKED_PROFILES"
   STANDALONE_PROFILES_BEFORE="$STANDALONE_PROFILES"
+  STANDALONE_RUNNING_BEFORE="$STANDALONE_RUNNING"
   if [ "$UPDATE_AVAILABLE" = no ]; then
     UPDATE_NEEDED="no"
     UPDATE_EXIT="not run"
