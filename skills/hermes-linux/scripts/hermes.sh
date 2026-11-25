@@ -75,6 +75,8 @@ INSTALL_KIND="unknown"
 CHANNEL="unknown"
 STABLE_TARGET="unknown"
 STABLE_TARGET_SHA="unknown"
+STABLE_TARGET_BEFORE="unknown"
+STABLE_TARGET_SHA_BEFORE="unknown"
 UPDATE_AVAILABLE="unknown"
 UPDATE_CHECK_STATUS="not run"
 UPDATE_PLAN_STATUS="not run"
@@ -111,11 +113,26 @@ SERVE_USER="unknown"
 SERVE_EXEC="unknown"
 SERVE_UNIT_EXISTS="unknown"
 PRE_SERVE_ACTIVE="unknown"
+PRE_GATEWAY_UNIT=""
+PRE_GATEWAY_SCOPE=""
+PRE_GATEWAY_USER=""
+PRE_GATEWAY_EXEC=""
+PRE_SERVE_UNIT=""
+PRE_SERVE_SCOPE=""
+PRE_SERVE_USER=""
+PRE_SERVE_UNIT_EXISTS="unknown"
 BACKEND_READY="unknown"
 LINGER="unknown"
 EXPECTED_PROFILES=""
 EXPECTED_PROFILE_COUNT="unknown"
 PROFILE_DIRS=""
+REGISTERED_PROFILES=""
+PARKED_PROFILES=""
+STANDALONE_PROFILES=""
+EXPECTED_SERVED_PROFILES=""
+REGISTERED_PROFILES_BEFORE=""
+PARKED_PROFILES_BEFORE=""
+STANDALONE_PROFILES_BEFORE=""
 SERVED_PROFILES=""
 SERVED_PROFILE_COUNT="unknown"
 MISSING_PROFILES=""
@@ -864,18 +881,57 @@ discover_profiles() {
 
   capture 90 "$HERMES_BIN" profile list
   PROFILE_LIST_STATUS="exit $RUN_STATUS"
-  local registered=""
+  local registered="" served="" parked="" standalone=""
   if [ "$RUN_STATUS" -eq 0 ]; then
     registered=$(printf '%s\n' "$RUN_OUTPUT" | awk '
       /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
         name=$1; sub(/^[◆*]+/, "", name);
+        if (name == "Profile") next;
+        if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
         if (tolower($0) ~ /deleted/) next;
         print name
       }' | sort -u | tr '\n' ',' | sed 's/,$//')
+    served=$(printf '%s\n' "$RUN_OUTPUT" | awk '
+      /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
+        name=$1; sub(/^[◆*]+/, "", name);
+        if (name == "Profile") next;
+        if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
+        if (tolower($0) ~ /deleted/) next;
+        if (tolower($0) ~ /parked/) next;
+        if (tolower($0) ~ /standalone/) next;
+        if ($0 ~ /running|connected/) print name
+      }' | sort -u | tr '\n' ',' | sed 's/,$//')
+    parked=$(printf '%s\n' "$RUN_OUTPUT" | awk '
+      /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
+        name=$1; sub(/^[◆*]+/, "", name);
+        if (name == "Profile") next;
+        if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
+        if (tolower($0) ~ /deleted/) next;
+        if (tolower($0) ~ /parked/) print name
+      }' | sort -u | tr '\n' ',' | sed 's/,$//')
+    standalone=$(printf '%s\n' "$RUN_OUTPUT" | awk '
+      /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
+        name=$1; sub(/^[◆*]+/, "", name);
+        if (name == "Profile") next;
+        if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
+        if (tolower($0) ~ /deleted/) next;
+        if (tolower($0) ~ /standalone/) print name
+      }' | sort -u | tr '\n' ',' | sed 's/,$//')
   fi
-  # Expected profile inventory comes from the native plan, then registered
-  # profiles. Filesystem directories alone are not authoritative because
-  # deleted profiles can leave stale directories behind.
+  REGISTERED_PROFILES="$registered"
+  PARKED_PROFILES="$parked"
+  STANDALONE_PROFILES="$standalone"
+  EXPECTED_SERVED_PROFILES="$registered"
+  if [ -n "$parked" ]; then
+    for p in $(printf '%s' "$parked" | tr ',' ' '); do
+      EXPECTED_SERVED_PROFILES=$(printf '%s' "$EXPECTED_SERVED_PROFILES" | tr ',' '\n' | grep -Fxv "$p" | tr '\n' ',' | sed 's/,$//')
+    done
+  fi
+  if [ -n "$standalone" ]; then
+    for p in $(printf '%s' "$standalone" | tr ',' ' '); do
+      EXPECTED_SERVED_PROFILES=$(printf '%s' "$EXPECTED_SERVED_PROFILES" | tr ',' '\n' | grep -Fxv "$p" | tr '\n' ',' | sed 's/,$//')
+    done
+  fi
   if [ -z "$EXPECTED_PROFILES" ]; then
     if [ -n "$PLAN_PROFILES" ]; then
       EXPECTED_PROFILES="$PLAN_PROFILES"
@@ -885,7 +941,6 @@ discover_profiles() {
       EXPECTED_PROFILES="default,$PROFILE_DIRS"
     fi
   fi
-  # Exclude profiles that are not registered (including deleted ones).
   if [ -n "$registered" ] && [ -n "$EXPECTED_PROFILES" ]; then
     local filtered="" p
     for p in $(printf '%s' "$EXPECTED_PROFILES" | tr ',' ' '); do
@@ -896,19 +951,10 @@ discover_profiles() {
     done
     [ -n "$filtered" ] && EXPECTED_PROFILES="$filtered"
   fi
-
-  capture 90 "$HERMES_BIN" profile list
-  PROFILE_LIST_STATUS="exit $RUN_STATUS"
-  local served=""
-  if [ "$RUN_STATUS" -eq 0 ]; then
-    served=$(printf '%s\n' "$RUN_OUTPUT" | awk '
-      /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
-        name=$1; sub(/^[◆*]+/, "", name);
-        if (tolower($0) ~ /deleted/) next;
-        if ($0 ~ /running|connected/) print name
-      }' | sort -u | tr '\n' ',' | sed 's/,$//')
+  if [ -n "$EXPECTED_SERVED_PROFILES" ]; then
+    EXPECTED_PROFILES="$EXPECTED_SERVED_PROFILES"
   fi
-  # The HTTP status payload is the strongest served-profile evidence.
+
   if [ -n "$HTTP_PROFILES" ]; then
     SERVED_PROFILES="$HTTP_PROFILES"
   else
@@ -1027,7 +1073,7 @@ probe_backend() {
     HTTP_CHECK="NOT_TESTED"
     if [ "$SERVE_UNIT_EXISTS" = yes ] && [ "$SERVE_ACTIVE" = active ]; then
       record_check_row "Backend HTTP + JSON" "GET /api/status" "backend active but URL not discovered" "UNKNOWN"
-      add_unverified SERVE_BACKEND "backend service is active but HTTP health was not verified (no verified URL)"
+      [ "${PROBE_QUIET:-no}" != yes ] && add_unverified SERVE_BACKEND "backend service is active but HTTP health was not verified (no verified URL)"
     else
       record_check_row "Backend HTTP + JSON" "GET /api/status" "no verified backend URL" "NOT_TESTED"
       add_unknown "Desktop backend URL was not discoverable and none was supplied"
@@ -1037,7 +1083,9 @@ probe_backend() {
   BACKEND_URL_DISPLAY=$(printf '%s' "$BACKEND_URL" | sanitize_text)
   local body="$TMP_RUN/http_body.json" headers="$TMP_RUN/http_headers.txt"
   local meta
-  capture 15 curl -sS -m 8 --connect-timeout 4 -o "$body" -D "$headers" -w '%{http_code}|%{content_type}|%{time_total}' "$BACKEND_URL/api/status"
+  local probe_timeout="${PROBE_TIMEOUT:-8}"
+  [ "$probe_timeout" -lt 1 ] && probe_timeout=1
+  capture "$probe_timeout" curl -sS -m "$probe_timeout" --connect-timeout "$probe_timeout" -o "$body" -D "$headers" -w '%{http_code}|%{content_type}|%{time_total}' "$BACKEND_URL/api/status"
   local curl_status="$RUN_STATUS"
   meta="$RUN_OUTPUT"
   HTTP_CODE=$(printf '%s' "$meta" | cut -d'|' -f1)
@@ -1048,7 +1096,7 @@ probe_backend() {
     HTTP_CHECK="FAIL"
     record_check_row "Backend HTTP + JSON" "HTTP 2xx with Hermes JSON" \
       "curl exit $curl_status from $BACKEND_URL_DISPLAY" "FAIL"
-    add_degraded NETWORK "Desktop backend did not answer GET /api/status (curl exit $curl_status at $BACKEND_URL_DISPLAY)"
+    [ "${PROBE_QUIET:-no}" != yes ] && add_degraded NETWORK "Desktop backend did not answer GET /api/status (curl exit $curl_status at $BACKEND_URL_DISPLAY)"
     record_timeline "L3" "curl GET $BACKEND_URL/api/status" "curl exit $curl_status" "no response"
     return 0
   fi
@@ -1058,7 +1106,7 @@ probe_backend() {
       HTTP_CHECK="AUTH_REQUIRED"
       record_check_row "Backend HTTP + JSON" "HTTP 2xx with Hermes JSON" \
         "HTTP $HTTP_CODE; listener answered, authentication not proven" "FAIL"
-      add_degraded AUTH "backend answered HTTP $HTTP_CODE; this proves a listener, not a healthy authenticated Hermes session"
+      [ "${PROBE_QUIET:-no}" != yes ] && add_degraded AUTH "backend answered HTTP $HTTP_CODE; this proves a listener, not a healthy authenticated Hermes session"
       add_unknown "Authenticated Desktop session and WebSocket were not tested"
       ;;
     2*)
@@ -1124,17 +1172,17 @@ PY
         record_check_row "Backend HTTP + JSON" "HTTP 2xx with Hermes JSON" \
           "HTTP 200; version=${HTTP_VERSION:-unknown}; auth_required=${HTTP_AUTH_REQUIRED:-unknown}; overall=${HTTP_OVERALL:-unknown}" "PASS"
         if [ "$HTTP_AUTH_REQUIRED" = True ] || [ "$HTTP_AUTH_REQUIRED" = true ]; then
-          add_unknown "Backend advertises auth_required=true; authenticated session is not proven by this probe"
+          [ "${PROBE_QUIET:-no}" != yes ] && add_unknown "Backend advertises auth_required=true; authenticated session is not proven by this probe"
         fi
         if [ -n "$dashboard_status" ] && [ "$dashboard_status" != ok ]; then
-          add_degraded SERVE_BACKEND "backend reports dashboard component status '$dashboard_status'"
+          [ "${PROBE_QUIET:-no}" != yes ] && add_degraded SERVE_BACKEND "backend reports dashboard component status '$dashboard_status'"
         fi
       else
         HTTP_PROTOCOL="invalid-json-or-shape"
         HTTP_CHECK="FAIL"
         record_check_row "Backend HTTP + JSON" "HTTP 2xx with Hermes JSON" \
           "HTTP 200 but response is not recognizable Hermes JSON (content-type=$HTTP_CONTENT_TYPE)" "FAIL"
-        add_degraded PROTOCOL "HTTP 200 from $BACKEND_URL_DISPLAY did not contain recognizable Hermes status JSON"
+        [ "${PROBE_QUIET:-no}" != yes ] && add_degraded PROTOCOL "HTTP 200 from $BACKEND_URL_DISPLAY did not contain recognizable Hermes status JSON"
         add_confirmed "Backend returned HTTP 200 with content-type '$HTTP_CONTENT_TYPE' but failed Hermes payload validation"
         add_unknown "Raw response body omitted from the report to avoid leaking configuration"
       fi
@@ -1142,7 +1190,7 @@ PY
     *)
       HTTP_CHECK="FAIL"
       record_check_row "Backend HTTP + JSON" "HTTP 2xx with Hermes JSON" "HTTP $HTTP_CODE" "FAIL"
-      add_degraded PROTOCOL "backend returned HTTP $HTTP_CODE from $BACKEND_URL_DISPLAY"
+      [ "${PROBE_QUIET:-no}" != yes ] && add_degraded PROTOCOL "backend returned HTTP $HTTP_CODE from $BACKEND_URL_DISPLAY"
       add_confirmed "Backend listener answered with HTTP $HTTP_CODE"
       ;;
   esac
@@ -1298,14 +1346,47 @@ decide_check() {
   add_affected "No service was restarted and no configuration was changed during check"
 }
 
+exec_signature() {
+  local exec="$1" path argv
+  path=$(printf '%s' "$exec" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
+  argv=$(printf '%s' "$exec" | sed -n 's/.*argv\[\]=\([^;]*\);.*/\1/p' | head -n 1)
+  printf '%s|%s' "$path" "$argv"
+}
+
+check_update_execution_context() {
+  local ancestor=$$ cgroup args parent
+  while [ "$ancestor" -gt 1 ] 2>/dev/null; do
+    [ -r "/proc/$ancestor/status" ] && [ -r "/proc/$ancestor/cgroup" ] || {
+      add_blocked PRECHECK "process ancestry cannot be verified; run the update from an independent terminal"
+      return 1
+    }
+    cgroup=$(cat "/proc/$ancestor/cgroup" 2>/dev/null)
+    args=$(tr '\0' ' ' <"/proc/$ancestor/cmdline" 2>/dev/null)
+    if printf '%s\n%s\n' "$cgroup" "$args" | grep -qiE 'hermes[^ /]*(gateway|serve)|hermes[-_](gateway|serve)\.service'; then
+      add_blocked PRECHECK "update was launched from a Hermes-managed service or agent context; use an independent SSH or terminal session"
+      return 1
+    fi
+    parent=$(awk '/^PPid:/ {print $2}' "/proc/$ancestor/status" 2>/dev/null)
+    [ -n "$parent" ] && [ "$parent" != "$ancestor" ] || {
+      add_blocked PRECHECK "process ancestry cannot be verified; run the update from an independent terminal"
+      return 1
+    }
+    ancestor="$parent"
+  done
+  return 0
+}
+
 update_preflight() {
   local n=0
+  check_update_execution_context || true
   # Re-derive hard blockers from collected evidence.
   if [ "$EFFECTIVE_UID" = 0 ]; then add_blocked PRECHECK "refusing update as root"; fi
   if [ -z "$CHECKOUT" ]; then add_blocked PRECHECK "source checkout not resolved"; fi
   if [ "$PROVENANCE_OK" != yes ]; then add_blocked PRECHECK "not an official NousResearch/hermes-agent checkout ('$GIT_REMOTE')"; fi
   if [ "$INSTALL_KIND" != git ]; then add_blocked PRECHECK "install method '$INSTALL_KIND' is not a managed git checkout"; fi
   if [ "$CHANNEL" != stable ]; then add_blocked PRECHECK "update channel is '$CHANNEL', not stable"; fi
+  if [ "$UPDATE_AVAILABLE" = yes ] && { [ -z "$STABLE_TARGET" ] || [ "$STABLE_TARGET" = unknown ]; }; then add_blocked PRECHECK "stable target version could not be established"; fi
+  if [ "$UPDATE_AVAILABLE" = yes ] && { [ -z "$STABLE_TARGET_SHA" ] || [ "$STABLE_TARGET_SHA" = unknown ]; }; then add_blocked PRECHECK "stable target revision could not be established"; fi
   if [ "$GIT_INTEGRITY_OK" != yes ]; then add_blocked PRECHECK "Git repository integrity could not be proven; refusing update"; fi
   if [ "$GIT_DIRTY" != no ]; then add_blocked PRECHECK "checkout cleanliness is '$GIT_DIRTY'; refusing to stash/reset/assume clean (see git status evidence)"; fi
   if [ "$CHECKOUT_OK" != yes ]; then add_blocked PRECHECK "checkout is on custom branch '$GIT_BRANCH'"; fi
@@ -1340,20 +1421,33 @@ update_preflight() {
 }
 
 poll_backend_ready() {
-  local attempts="${HERMES_OPS_BACKEND_READY_ATTEMPTS:-10}" i
+  local start now remaining sleep_s
+  start=$(date +%s)
   BACKEND_READY="no"
-  for ((i = 1; i <= attempts; i++)); do
+  while :; do
+    now=$(date +%s)
+    remaining=$((90 - (now - start)))
+    [ "$remaining" -le 0 ] && break
+    PROBE_TIMEOUT=$remaining
+    [ "$PROBE_TIMEOUT" -gt 8 ] && PROBE_TIMEOUT=8
+    [ "$PROBE_TIMEOUT" -lt 1 ] && PROBE_TIMEOUT=1
+    PROBE_QUIET=yes
+    discover_backend_url
     probe_backend
-    if [ "$HTTP_CHECK" = PASS ]; then
+    PROBE_QUIET=no
+    if [ "$HTTP_CHECK" = PASS ] && { [ -z "$HTTP_VERSION" ] || [ "$HTTP_VERSION" = unknown ] || [ "$HTTP_VERSION" = "$HERMES_VERSION" ]; } && [ "$HTTP_OVERALL" != invalid ]; then
       BACKEND_READY="yes"
       return 0
     fi
-    if [ "$i" -lt "$attempts" ]; then
-      sleep 2
-    fi
+    now=$(date +%s)
+    remaining=$((90 - (now - start)))
+    [ "$remaining" -le 1 ] && break
+    sleep_s=2
+    [ "$sleep_s" -gt "$remaining" ] && sleep_s=$remaining
+    [ "$sleep_s" -gt 0 ] && sleep "$sleep_s"
   done
   BACKEND_READY="no"
-  add_degraded SERVE_BACKEND "backend did not become ready after bounded polling (${attempts} attempts)"
+  add_degraded SERVE_BACKEND "backend did not become ready within the 90-second readiness budget"
   return 1
 }
 
@@ -1383,10 +1477,77 @@ perform_update() {
   return 0
 }
 
+verify_gateway_runtime() {
+  [ -n "$GATEWAY_UNIT" ] || { add_degraded GATEWAY "gateway unit missing after update"; return; }
+  if [ "$GATEWAY_UNIT" != "$PRE_GATEWAY_UNIT" ] || [ "$GATEWAY_SCOPE" != "$PRE_GATEWAY_SCOPE" ] || [ "$GATEWAY_USER" != "$PRE_GATEWAY_USER" ]; then
+    add_degraded GATEWAY "gateway identity changed after update (unit=$GATEWAY_UNIT scope=$GATEWAY_SCOPE user=$GATEWAY_USER)"
+  fi
+  if [ -z "$GATEWAY_ACTIVE" ] || [ "$GATEWAY_ACTIVE" != active ]; then
+    add_degraded GATEWAY "gateway is not active after update (${GATEWAY_ACTIVE:-unknown})"
+  fi
+  local gw_exec_sig pre_exec_sig
+  gw_exec_sig=$(printf '%s' "$GATEWAY_EXEC" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
+  pre_exec_sig=$(printf '%s' "$PRE_GATEWAY_EXEC" | sed -n 's/.*path=\([^ ;]*\).*/\1/p' | head -n 1)
+  if [ -n "$gw_exec_sig" ] && [ "$gw_exec_sig" != "$pre_exec_sig" ]; then
+    add_degraded GATEWAY "gateway ExecStart changed after update"
+  fi
+  if ! printf '%s' "$GATEWAY_EXEC" | grep -Fq "$CHECKOUT"; then
+    add_degraded GATEWAY "gateway checkout binding changed after update"
+  fi
+}
+
+verify_backend_runtime() {
+  if [ "$PRE_SERVE_UNIT_EXISTS" != yes ]; then
+    return 0
+  fi
+  if [ "$SERVE_UNIT_EXISTS" != yes ] || [ -z "$SERVE_UNIT" ]; then
+    add_degraded SERVE_BACKEND "backend disappeared after update"
+    return 0
+  fi
+  if [ "$SERVE_UNIT" != "$PRE_SERVE_UNIT" ] || [ "$SERVE_SCOPE" != "$PRE_SERVE_SCOPE" ] || [ "$SERVE_USER" != "$PRE_SERVE_USER" ]; then
+    add_degraded SERVE_BACKEND "backend identity changed after update"
+  fi
+  if [ "$SERVE_ACTIVE" != active ]; then
+    add_degraded SERVE_BACKEND "backend is not active after update (${SERVE_ACTIVE:-unknown})"
+  fi
+  if [ -n "$BACKEND_URL" ] && [ "$HTTP_CHECK" != PASS ]; then
+    add_degraded SERVE_BACKEND "backend HTTP health failed after update ($HTTP_CHECK)"
+  fi
+  if [ -n "$HTTP_VERSION" ] && [ "$HTTP_VERSION" != unknown ] && [ "$HTTP_VERSION" != "$HERMES_VERSION" ]; then
+    add_degraded SERVE_BACKEND "backend reports version $HTTP_VERSION, expected $HERMES_VERSION"
+  fi
+  if [ -n "$HTTP_OVERALL" ] && [ "$HTTP_OVERALL" != unknown ] && [ "$HTTP_OVERALL" != ok ]; then
+    add_degraded SERVE_BACKEND "backend reports overall status $HTTP_OVERALL"
+  fi
+}
+
+verify_profile_inventory() {
+  if [ -z "$REGISTERED_PROFILES_BEFORE" ]; then
+    return 0
+  fi
+  local p
+  for p in $(printf '%s' "$REGISTERED_PROFILES_BEFORE" | tr ',' ' '); do
+    [ -n "$p" ] || continue
+    if ! printf '%s\n' "$REGISTERED_PROFILES" | tr ',' '\n' | grep -Fxq "$p"; then
+      add_degraded GATEWAY "registered profile disappeared after update: $p"
+    fi
+  done
+  if [ "$PARKED_PROFILES" != "$PARKED_PROFILES_BEFORE" ]; then
+    add_degraded GATEWAY "parked profile state changed after update"
+  fi
+  if [ "$STANDALONE_PROFILES" != "$STANDALONE_PROFILES_BEFORE" ]; then
+    add_degraded GATEWAY "standalone profile state changed after update"
+  fi
+  if [ -n "$MISSING_PROFILES" ]; then
+    add_degraded GATEWAY "expected profile(s) not served after update: $MISSING_PROFILES"
+  fi
+}
+
 decide_update() {
-  local blocks problems
+  local blocks problems unverified
   blocks=$(count_lines "$BLOCKED_FILE")
   problems=0
+  unverified=$(count_lines "$UNVERIFIED_FILE")
   if [ "$UPDATE_EXIT" != "not run" ] && [ "$UPDATE_EXIT" -ne 0 ]; then
     problems=$((problems + 1))
     add_degraded SOURCE_UPDATE "official updater exited $UPDATE_EXIT; not retried"
@@ -1407,6 +1568,33 @@ decide_update() {
       problems=$((problems + 1))
       add_degraded RECEIPT "native receipt correlation_id '${RECEIPT_CORRELATION:-missing}' does not match update '$UPDATE_CORRELATION_ID'"
     fi
+    if [ "$STABLE_TARGET" != unknown ] && [ "$HERMES_VERSION_AFTER" != "$STABLE_TARGET" ]; then
+      problems=$((problems + 1))
+      add_degraded SOURCE_UPDATE "installed version v$HERMES_VERSION_AFTER does not equal selected stable release v$STABLE_TARGET"
+    fi
+    if [ "$STABLE_TARGET_BEFORE" != unknown ] && [ "$STABLE_TARGET" != unknown ] && [ "$STABLE_TARGET" != "$STABLE_TARGET_BEFORE" ]; then
+      problems=$((problems + 1))
+      add_degraded SOURCE_UPDATE "stable target changed during execution: $STABLE_TARGET_BEFORE -> $STABLE_TARGET"
+    fi
+    if [ "$STABLE_TARGET_SHA_BEFORE" != unknown ] && [ "$STABLE_TARGET_SHA" != unknown ] && [ "$STABLE_TARGET_SHA" != "$STABLE_TARGET_SHA_BEFORE" ]; then
+      problems=$((problems + 1))
+      add_degraded SOURCE_UPDATE "stable target revision changed during execution"
+    fi
+    if [ "$PROVENANCE_OK" != yes ]; then
+      problems=$((problems + 1))
+      add_degraded SOURCE_UPDATE "repository provenance is not official after update"
+    fi
+    if [ "$GIT_INTEGRITY_OK" != yes ]; then
+      problems=$((problems + 1))
+      add_degraded SOURCE_UPDATE "repository integrity could not be proven after update"
+    fi
+    if [ "$GIT_DIRTY" != no ]; then
+      problems=$((problems + 1))
+      add_degraded SOURCE_UPDATE "checkout is dirty after update"
+    fi
+  fi
+  if [ "$unverified" -gt 0 ]; then
+    problems=$((problems + 1))
   fi
   if [ "$GATEWAY_ACTIVE" != active ]; then
     problems=$((problems + 1))
@@ -1661,7 +1849,7 @@ main() {
 
   if [ "$MODE" = check ]; then
     decide_check
-    write_report check; rc=$?; echo "DEBUG write_report rc=$rc EXIT_CODE=$EXIT_CODE" >&2
+    write_report check
     print_summary
     exit "$EXIT_CODE"
   fi
@@ -1680,7 +1868,20 @@ main() {
 
   # Preflight passed. Record exactly what was true before mutation.
   PRE_SERVE_ACTIVE="$SERVE_ACTIVE"
+  PRE_GATEWAY_UNIT="$GATEWAY_UNIT"
+  PRE_GATEWAY_SCOPE="$GATEWAY_SCOPE"
+  PRE_GATEWAY_USER="$GATEWAY_USER"
+  PRE_GATEWAY_EXEC="$GATEWAY_EXEC"
+  PRE_SERVE_UNIT="$SERVE_UNIT"
+  PRE_SERVE_SCOPE="$SERVE_SCOPE"
+  PRE_SERVE_USER="$SERVE_USER"
+  PRE_SERVE_UNIT_EXISTS="$SERVE_UNIT_EXISTS"
   GIT_HEAD_BEFORE="$GIT_HEAD"
+  STABLE_TARGET_BEFORE="$STABLE_TARGET"
+  STABLE_TARGET_SHA_BEFORE="$STABLE_TARGET_SHA"
+  REGISTERED_PROFILES_BEFORE="$REGISTERED_PROFILES"
+  PARKED_PROFILES_BEFORE="$PARKED_PROFILES"
+  STANDALONE_PROFILES_BEFORE="$STANDALONE_PROFILES"
   if [ "$UPDATE_AVAILABLE" = no ]; then
     UPDATE_NEEDED="no"
     UPDATE_EXIT="not run"
@@ -1691,6 +1892,9 @@ main() {
   # Re-collect post-state read-only. Keep timeline; replace check rows so the
   # report's comparison table reflects verified post-update state.
   : >"$CHECK_ROWS"
+  : >"$BLOCKED_FILE"
+  : >"$DEGRADED_FILE"
+  : >"$UNVERIFIED_FILE"
   collect_all "post-update"
   if [ "$UPDATE_NEEDED" = yes ] && [ "$HERMES_VERSION" != unknown ]; then
     HERMES_VERSION_AFTER="$HERMES_VERSION"
@@ -1702,6 +1906,9 @@ main() {
     if [ -n "$BACKEND_URL" ]; then
       poll_backend_ready || true
     fi
+    verify_gateway_runtime
+    verify_backend_runtime
+    verify_profile_inventory
   fi
   decide_update
   write_report update

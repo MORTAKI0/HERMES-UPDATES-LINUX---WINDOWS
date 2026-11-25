@@ -177,6 +177,7 @@ case "${1:-}" in
           git -C "$FAKE_CHECKOUT" checkout -q --detach "$(cat "$FAKE_SBX/target-sha")"
         fi
         cp "$fixtures/version_after.txt" "$fixtures/version.txt"
+        sed -i 's/"version":"0.23.2"/"version":"0.23.3"/' "$fixtures/http_body.json"
         if [ ! -f "$fixtures/no_upstream_gateway_restart" ]; then
           echo $(( $(cat "$FAKE_SBX/pids/gateway") + 100 )) >"$FAKE_SBX/pids/gateway"
         fi
