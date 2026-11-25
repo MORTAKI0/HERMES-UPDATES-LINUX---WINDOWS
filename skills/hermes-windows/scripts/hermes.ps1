@@ -41,6 +41,8 @@ $ProgressPreference = 'SilentlyContinue'
 
 $script:ScriptVersion = '1.0.0'
 $script:Operation = $Action
+$script:BackendUrlInput = [string]$BackendUrl
+$script:BackendUrlExplicit = [bool]$PSBoundParameters.ContainsKey('BackendUrl')
 $script:StartedUtc = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
 $script:StartedAt = Get-Date
 
@@ -78,6 +80,27 @@ $script:SourceChannel = 'unknown'
 $script:SourceVersionOk = 'unknown'
 $script:UpdateCheckChannel = 'unknown'
 $script:SourceProvenanceOk = 'unknown'
+$script:InstallId = 'unknown'
+$script:InstallIdBefore = 'unknown'
+$script:CanonicalCheckout = 'unknown'
+$script:CheckoutBefore = 'unknown'
+$script:CliPathBefore = ''
+$script:GitHead = 'unknown'
+$script:GitHeadBefore = 'unknown'
+$script:GitIntegrityOk = 'unknown'
+$script:StableTargetVersion = 'unknown'
+$script:StableTargetVersionBefore = 'unknown'
+$script:StableTargetShort = 'unknown'
+$script:StableTargetShortBefore = 'unknown'
+$script:StableTargetFull = 'unknown'
+$script:StableTargetFullBefore = 'unknown'
+$script:SourceVerification = 'not applicable'
+$script:DesktopBuildExpected = 'unknown'
+$script:DesktopBuildVerified = 'unverified'
+$script:DesktopArtifactPath = 'not found'
+$script:DesktopRepairRun = 'no'
+$script:DesktopRepairResult = 'not applicable'
+$script:UpdateCorrelationId = ''
 $script:GitRemote = 'unknown'
 $script:GitBranch = 'unknown'
 $script:GitDirty = 'unknown'
@@ -113,6 +136,7 @@ $script:HttpProtocol = 'unknown'
 $script:HttpAuthRequired = 'unknown'
 $script:HttpVersion = 'unknown'
 $script:HttpOverall = 'unknown'
+$script:BackendHealthState = 'unknown'
 $script:AuthState = 'NOT_TESTED'
 $script:WebSocketState = 'NOT_TESTED'
 
@@ -123,6 +147,9 @@ $script:ReceiptFollowupText = ''
 $script:ReceiptGatewayIncomplete = 'unknown'
 $script:ReceiptFresh = 'unknown'
 $script:ReceiptCheck = 'NOT_TESTED'
+$script:ReceiptCorrelation = 'unknown'
+$script:ReceiptContractValid = 'no'
+$script:ReceiptBuildFailure = 'unknown'
 $script:DesktopBuildState = 'unknown'
 
 $script:UpdateOutput = ''
@@ -130,8 +157,6 @@ $script:UpdateExit = 'not run'
 $script:UpdateNeeded = $false
 $script:UpdateAttempted = $false
 $script:PostPackageVerified = 'not applicable'
-$script:DesktopRepairRun = 'no'
-$script:DesktopRepairResult = 'not applicable'
 
 $script:CheckRows = New-Object System.Collections.Generic.List[string]
 $script:TimelineRows = New-Object System.Collections.Generic.List[string]
@@ -263,7 +288,13 @@ function Invoke-Native {
         return 127
     }
     $global:LASTEXITCODE = 0
+    $previousOutputEncoding = $null
     try {
+        # Windows PowerShell 5.1 decodes native stdout/stderr with the console
+        # encoding. Hermes emits UTF-8; decode it as such without leaving a
+        # permanent console/code-page change behind.
+        $previousOutputEncoding = [Console]::OutputEncoding
+        [Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
         $script:NativeOutput = (& $Command @Arguments 2>&1 | Out-String)
         if ($null -eq $LASTEXITCODE) {
             $script:NativeExit = 0
@@ -273,6 +304,10 @@ function Invoke-Native {
     } catch {
         $script:NativeOutput = $_.Exception.Message
         $script:NativeExit = 1
+    } finally {
+        if ($null -ne $previousOutputEncoding) {
+            try { [Console]::OutputEncoding = $previousOutputEncoding } catch { }
+        }
     }
     return $script:NativeExit
 }
@@ -301,6 +336,16 @@ function Normalize-BackendUrl {
         return ''
     }
     return $uri.GetLeftPart([UriPartial]::Path).TrimEnd('/')
+}
+
+function Get-HermesHomePath {
+    if (-not [string]::IsNullOrWhiteSpace($env:HERMES_HOME)) {
+        return $env:HERMES_HOME
+    }
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        return (Join-Path $env:LOCALAPPDATA 'hermes')
+    }
+    return (Join-Path $env:USERPROFILE '.hermes')
 }
 
 function Initialize-Environment {
@@ -333,9 +378,12 @@ function Initialize-Environment {
     }
     Add-CheckRow 'Execution account' 'non-elevated interactive account' $script:Account 'PASS'
 
-    if (-not [string]::IsNullOrWhiteSpace($BackendUrl)) {
-        $script:BackendUrlRaw = $BackendUrl
+    if ($script:BackendUrlExplicit) {
+        $script:BackendUrlRaw = $script:BackendUrlInput
         $script:BackendUrlSource = 'explicit -BackendUrl'
+        if ([string]::IsNullOrWhiteSpace($script:BackendUrlRaw)) {
+            Add-Block 'PRECHECK' 'Backend URL is not an absolute URI.'
+        }
     } elseif (-not [string]::IsNullOrWhiteSpace($env:HERMES_DESKTOP_REMOTE_URL)) {
         $script:BackendUrlRaw = $env:HERMES_DESKTOP_REMOTE_URL
         $script:BackendUrlSource = 'pre-existing HERMES_DESKTOP_REMOTE_URL'
@@ -495,7 +543,10 @@ function Get-SourceVersion {
             Add-Degraded 'WINDOWS_PACKAGE' 'hermes --version did not contain a parseable vX.Y.Z version.'
         }
         $dirMatch = [regex]::Match($out, '(?im)^Install directory:\s*(.+?)\s*$')
-        if ($dirMatch.Success) { $script:SourceInstallDirectory = $dirMatch.Groups[1].Value }
+        if ($dirMatch.Success) {
+            $script:SourceInstallDirectory = $dirMatch.Groups[1].Value
+            $script:CanonicalCheckout = Get-NormalizedPath $script:SourceInstallDirectory
+        }
         $methodMatch = [regex]::Match($out, '(?im)^Install method:\s*(\S+)')
         if ($methodMatch.Success) { $script:SourceInstallMethod = $methodMatch.Groups[1].Value }
         $channelMatch = [regex]::Match($out, '(?i)\b(stable|canary|main)\b')
@@ -521,6 +572,7 @@ function Get-NormalizedPath {
 }
 
 function Test-SourceProvenance {
+    param([switch]$AfterUpdate)
     if ($script:Owner -ne 'Source build') { return }
     $issues = @()
     if ($script:SourceVersionOk -ne 'yes') { $issues += 'hermes --version did not complete successfully; CLI provenance is unavailable.' }
@@ -555,8 +607,8 @@ function Test-SourceProvenance {
     if ($script:SourceChannel -ne 'stable') {
         $issues += "installed update channel '$($script:SourceChannel)' is not stable."
     }
-    if (($script:UpdateCheckChannel -ne 'unknown') -and ($script:UpdateCheckChannel -ne 'stable')) {
-        $issues += "update-check channel '$($script:UpdateCheckChannel)' is not stable."
+    if ($script:UpdateCheckChannel -ne 'stable') {
+        $issues += "update-check channel '$($script:UpdateCheckChannel)' is not verified stable."
     }
     if (($script:SourceChannel -ne 'unknown') -and ($script:UpdateCheckChannel -ne 'unknown') -and
         ($script:SourceChannel -ne $script:UpdateCheckChannel)) {
@@ -569,6 +621,16 @@ function Test-SourceProvenance {
         $insideExit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'rev-parse', '--is-inside-work-tree')
         if (($insideExit -ne 0) -or ($script:NativeOutput.Trim() -ne 'true')) {
             $issues += "git rev-parse --is-inside-work-tree failed (exit $insideExit)."
+            $script:GitIntegrityOk = 'no'
+        }
+        $headExit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'rev-parse', 'HEAD')
+        $headOut = $script:NativeOutput.Trim()
+        if (($headExit -eq 0) -and ($headOut -match '^[0-9a-fA-F]{40}$')) {
+            $script:GitHead = $headOut.ToLowerInvariant()
+        } else {
+            $script:GitHead = 'unknown'
+            $script:GitIntegrityOk = 'no'
+            $issues += "git rev-parse HEAD did not return one full commit (exit $headExit)."
         }
         $remoteExit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'remote', 'get-url', 'origin')
         $remotes = @($script:NativeOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
@@ -604,16 +666,20 @@ function Test-SourceProvenance {
 
     if ($issues.Count -eq 0) {
         $script:SourceProvenanceOk = 'yes'
+        $script:GitIntegrityOk = 'yes'
         Add-CheckRow 'Source provenance' 'official checkout, stable channel, clean tree' `
-            "checkout=$($script:SourceCheckout); remote=$($script:GitRemote); branch=$($script:GitBranch); dirty=$($script:GitDirty)" 'PASS'
+            "checkout=$($script:CanonicalCheckout); head=$($script:GitHead); remote=$($script:GitRemote); branch=$($script:GitBranch); dirty=$($script:GitDirty)" 'PASS'
     } else {
         $script:SourceProvenanceOk = 'no'
-        foreach ($issue in $issues) { Add-Block 'PRECHECK' $issue }
+        if ($script:GitIntegrityOk -ne 'no') { $script:GitIntegrityOk = 'no' }
+        foreach ($issue in $issues) {
+            if ($AfterUpdate) { Add-Degraded 'SOURCE_UPDATE' $issue } else { Add-Block 'PRECHECK' $issue }
+        }
         Add-CheckRow 'Source provenance' 'official checkout, stable channel, clean tree' `
             "remote=$($script:GitRemote); branch=$($script:GitBranch); dirty=$($script:GitDirty); issues=$($issues.Count)" 'FAIL'
     }
     Add-Timeline 'PRECHECK' 'source provenance' $script:SourceProvenanceOk `
-        "remote=$($script:GitRemote); branch=$($script:GitBranch); dirty=$($script:GitDirty)"
+        "remote=$($script:GitRemote); branch=$($script:GitBranch); head=$($script:GitHead); dirty=$($script:GitDirty)"
 }
 
 function Resolve-Owner {
@@ -685,27 +751,42 @@ function Resolve-Owner {
 }
 
 function Get-SourceUpdateAvailability {
+    param([switch]$AfterUpdate)
     if ([string]::IsNullOrEmpty($script:HeremesPath)) { return }
     $exit = Invoke-Native $script:HeremesPath @('update', '--check')
     $out = $script:NativeOutput
-    Add-Timeline 'WINDOWS_PACKAGE' 'hermes update --check' "exit $exit" (($out -split "`r?`n" | Select-Object -First 3) -join ' ')
+    Add-Timeline 'WINDOWS_PACKAGE' 'hermes update --check' "exit $exit" (($out -split "`r?`n" | Select-Object -First 4) -join ' ')
     if ($exit -ne 0) {
         Add-Degraded 'WINDOWS_PACKAGE' "hermes update --check failed (exit $exit)."
         $script:UpdateAvailable = 'unknown'
         return
     }
-    $m = [regex]::Match($out, 'v(\d+\.\d+\.\d+)')
-    if ($m.Success) {
-        $script:AvailableVersion = $m.Groups[1].Value
+
+    $channelMatch = [regex]::Match($out, '(?im)^\s*(?:[→>]\s*)?Update channel:\s*(?<channel>[A-Za-z0-9_-]+)\s*$')
+    if ($channelMatch.Success) {
+        $script:UpdateCheckChannel = $channelMatch.Groups['channel'].Value.ToLowerInvariant()
     }
-    $channelMatch = [regex]::Match($out, '(?i)Update channel:\s*(\S+)')
-    if ($channelMatch.Success) { $script:UpdateCheckChannel = $channelMatch.Groups[1].Value.ToLowerInvariant() }
-    if ($out -match '(?i)no update|up[ -]?to[ -]?date|already current') {
-        $script:UpdateAvailable = 'no'
-        $script:DistributorState = 'source stable channel current'
-    } elseif ($script:AvailableVersion -ne 'unknown') {
-        if ($script:InstalledVersion -ne 'unknown') {
-            $cmp = Compare-VersionStrings $script:InstalledVersion $script:AvailableVersion
+
+    $selected = [regex]::Match($out, '(?im)^\s*(?:[→>]\s*)?Selected release available:\s*(?<channel>[A-Za-z0-9_-]+)\s+v(?<version>\d+\.\d+\.\d+)\s*(?:\((?<sha>[0-9a-fA-F]{7,40})\))?\s*$')
+    $current = [regex]::Match($out, '(?im)^\s*(?:[→>✓]\s*)?(?:Already up to date|Up to date with the latest release|No newer release)[^v\r\n]*v(?<version>\d+\.\d+\.\d+)?')
+    if ($selected.Success) {
+        $selectedChannel = $selected.Groups['channel'].Value.ToLowerInvariant()
+        if ([string]::IsNullOrWhiteSpace($script:UpdateCheckChannel) -or ($script:UpdateCheckChannel -eq 'unknown')) {
+            $script:UpdateCheckChannel = $selectedChannel
+        }
+        $script:StableTargetVersion = $selected.Groups['version'].Value
+        $script:AvailableVersion = $script:StableTargetVersion
+        if ($selected.Groups['sha'].Success) {
+            $script:StableTargetShort = $selected.Groups['sha'].Value.ToLowerInvariant()
+        } else {
+            $script:StableTargetShort = 'unknown'
+        }
+        if ($selectedChannel -ne 'stable') {
+            $script:UpdateAvailable = 'unknown'
+            $script:DistributorState = "source channel $selectedChannel (not stable)"
+            Add-Degraded 'WINDOWS_PACKAGE' "Source update target is on channel '$selectedChannel', not stable."
+        } elseif (($script:InstalledVersion -ne 'unknown') -and ($script:InstalledVersion -match '^\d+\.\d+\.\d+$')) {
+            $cmp = Compare-VersionStrings $script:InstalledVersion $script:StableTargetVersion
             if ($cmp -gt 0) {
                 $script:UpdateAvailable = 'downgrade'
             } elseif ($cmp -eq 0) {
@@ -713,16 +794,123 @@ function Get-SourceUpdateAvailability {
             } else {
                 $script:UpdateAvailable = 'yes'
             }
+            $script:DistributorState = 'source stable channel'
         } else {
             $script:UpdateAvailable = 'unknown'
+            Add-Degraded 'WINDOWS_PACKAGE' 'Installed source version is not a parseable release.'
         }
-        $script:DistributorState = 'source stable channel'
+        if (($script:UpdateAvailable -eq 'yes') -and ($script:StableTargetShort -eq 'unknown')) {
+            Add-Degraded 'WINDOWS_PACKAGE' 'The stable target revision is missing from native update-check output.'
+        }
+    } elseif ($current.Success) {
+        if ($current.Groups['version'].Success) {
+            $script:StableTargetVersion = $current.Groups['version'].Value
+            $script:AvailableVersion = $script:StableTargetVersion
+        }
+        $script:StableTargetShort = 'unknown'
+        $script:UpdateAvailable = 'no'
+        $script:DistributorState = 'source stable channel current'
+    } elseif ($out -match '(?i)no update|up[ -]?to[ -]?date|already current') {
+        $script:UpdateAvailable = 'no'
+        $script:StableTargetShort = 'unknown'
+        $script:DistributorState = 'source stable channel current'
     } else {
         $script:UpdateAvailable = 'unknown'
+        $script:StableTargetShort = 'unknown'
+        $script:DistributorState = 'source stable channel unresolved'
         Add-Degraded 'WINDOWS_PACKAGE' 'Source update availability could not be parsed from the owner channel output.'
     }
+
     Add-CheckRow 'Source update availability' 'stable channel checked' `
-        "installed v$($script:InstalledVersion); available v$($script:AvailableVersion); update=$($script:UpdateAvailable)" 'INFO'
+        "installed v$($script:InstalledVersion); available v$($script:StableTargetVersion) ($($script:StableTargetShort)); update=$($script:UpdateAvailable); channel=$($script:UpdateCheckChannel)" 'INFO'
+}
+
+function Get-SourceInstallIdentity {
+    param([switch]$AfterUpdate)
+    if ([string]::IsNullOrEmpty($script:HeremesPath)) { return }
+    $exit = Invoke-Native $script:HeremesPath @('update', '--install-id')
+    $out = $script:NativeOutput
+    Add-Timeline 'WINDOWS_PACKAGE' 'hermes update --install-id' "exit $exit" (($out -split "`r?`n" | Select-Object -First 1) -join ' ')
+    $identity = ''
+    if ($exit -eq 0) {
+        $identity = (($out -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -First 1) -as [string])
+        if (-not [string]::IsNullOrWhiteSpace($identity)) { $identity = $identity.Trim() }
+    }
+    if (($exit -ne 0) -or [string]::IsNullOrWhiteSpace($identity) -or ($identity -notmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,255}$')) {
+        if ($AfterUpdate) {
+            Add-Degraded 'SOURCE_UPDATE' "Installation identity could not be re-read after update (exit $exit)."
+        } else {
+            Add-Block 'PRECHECK' "Installation identity could not be established (exit $exit); refusing to assume it."
+        }
+        $script:InstallId = 'unknown'
+        return
+    }
+    $script:InstallId = $identity
+    Add-CheckRow 'Installation identity' 'native install id' $identity 'PASS'
+}
+
+function Resolve-SourceTargetRevision {
+    param([switch]$AfterUpdate)
+    if ([string]::IsNullOrWhiteSpace($script:SourceCheckout)) {
+        if ($AfterUpdate) { Add-Degraded 'SOURCE_UPDATE' 'Source checkout is unavailable for target revision resolution.' } else { Add-Block 'PRECHECK' 'Source checkout is unavailable for target revision resolution.' }
+        return $false
+    }
+    if (($script:StableTargetShort -eq 'unknown') -or ($script:StableTargetShort -notmatch '^[0-9a-fA-F]{7,40}$')) {
+        if ($AfterUpdate) { Add-Degraded 'SOURCE_UPDATE' 'Stable target revision is unresolved.' } else { Add-Block 'PRECHECK' 'Stable target revision could not be established; refusing a blind update.' }
+        return $false
+    }
+    $rev = $script:StableTargetShort + '^{commit}'
+    $exit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'rev-parse', '--verify', $rev)
+    $lines = @($script:NativeOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $full = ''
+    if (($exit -eq 0) -and ($lines.Count -eq 1) -and ($lines[0].Trim() -match '^[0-9a-fA-F]{40}$')) {
+        $full = $lines[0].Trim().ToLowerInvariant()
+    } elseif (($script:StableTargetVersion -match '^\d+\.\d+\.\d+$') -and ($script:GitRemote -match 'NousResearch/hermes-agent')) {
+        # The pre-update checkout often does not have the selected release object yet.
+        # Resolve the immutable release tag against the already-verified official origin.
+        $tag = "v$($script:StableTargetVersion)"
+        $remoteExit = Invoke-Native 'git' @('-C', $script:SourceCheckout, 'ls-remote', 'origin', "refs/tags/$tag^{}", "refs/tags/$tag")
+        if ($remoteExit -eq 0) {
+            $remoteLines = @($script:NativeOutput -split "`r?`n" | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+            $peeled = @()
+            $direct = @()
+            foreach ($line in $remoteLines) {
+                $parts = $line.Trim() -split "`t", 2
+                if ($parts.Count -ne 2 -or $parts[0] -notmatch '^[0-9a-fA-F]{40}$') { continue }
+                if ($parts[1] -eq "refs/tags/$tag^{}") { $peeled += $parts[0].ToLowerInvariant() }
+                elseif ($parts[1] -eq "refs/tags/$tag") { $direct += $parts[0].ToLowerInvariant() }
+            }
+            if ($peeled.Count -gt 0) {
+                $candidate = @($peeled | Select-Object -Unique)
+            } else {
+                $candidate = @($direct | Select-Object -Unique)
+            }
+            if ($candidate.Count -eq 1) { $full = [string]$candidate[0] }
+        }
+    }
+    if ([string]::IsNullOrWhiteSpace($full) -or -not $full.StartsWith($script:StableTargetShort.ToLowerInvariant())) {
+        if ($AfterUpdate) { Add-Degraded 'SOURCE_UPDATE' 'Stable target revision could not be resolved to one full commit.' } else { Add-Block 'PRECHECK' 'Stable target revision could not be resolved to one full commit.' }
+        $script:StableTargetFull = 'unknown'
+        return $false
+    }
+    if (($script:StableTargetFull -ne 'unknown') -and ($script:StableTargetFull -ne $full)) {
+        if ($AfterUpdate) { Add-Degraded 'SOURCE_UPDATE' 'Stable target revision changed during resolution.' } else { Add-Block 'PRECHECK' 'Stable target revision changed during resolution.' }
+        return $false
+    }
+    $script:StableTargetFull = $full
+    Add-CheckRow 'Stable target revision' 'one authoritative full commit' $full 'PASS'
+    return $true
+}
+
+function Capture-SourceBaseline {
+    $script:StableTargetVersionBefore = $script:StableTargetVersion
+    $script:StableTargetShortBefore = $script:StableTargetShort
+    $script:StableTargetFullBefore = $script:StableTargetFull
+    $script:InstallIdBefore = $script:InstallId
+    $script:GitHeadBefore = $script:GitHead
+    $script:CheckoutBefore = $script:CanonicalCheckout
+    $script:CliPathBefore = $script:HeremesPath
+    Add-Evidence "Pre-update source identity: install=$($script:InstallIdBefore); version=v$($script:InstalledVersion); head=$($script:GitHeadBefore); checkout=$($script:CheckoutBefore); target=v$($script:StableTargetVersionBefore) ($($script:StableTargetFullBefore)); cli=$($script:CliPathBefore)"
 }
 
 function Compare-VersionStrings {
@@ -1055,6 +1243,14 @@ function Invoke-StatusProbe {
             $script:HttpVersion = [string]$data.version
             $script:HttpAuthRequired = [string]$data.auth_required
             $script:HttpOverall = [string]$data.overall
+            if ($script:HttpOverall -match '^(?i)ok$') {
+                $script:BackendHealthState = 'PASS'
+                Add-CheckRow 'Backend health' 'recognizable Hermes JSON with overall=ok' "overall=$($script:HttpOverall); version=$($script:HttpVersion)" 'PASS'
+            } else {
+                $script:BackendHealthState = 'FAIL'
+                Add-Degraded 'PROTOCOL' "Backend JSON is recognizable but overall status is '$($script:HttpOverall)', not ok."
+                Add-CheckRow 'Backend health' 'recognizable Hermes JSON with overall=ok' "overall=$($script:HttpOverall); version=$($script:HttpVersion)" 'FAIL'
+            }
             if ($props -contains 'profiles') {
                 $profileList = @($data.profiles) | ForEach-Object { [string]$_ }
                 Add-Evidence "Backend advertised profiles: $($profileList -join ', ')"
@@ -1087,77 +1283,302 @@ function Invoke-StatusProbe {
 # ---------------------------------------------------------------------------
 # Receipt
 # ---------------------------------------------------------------------------
-function Get-UpdateReceipt {
-    $hermesHome = $env:HERMES_HOME
-    if ([string]::IsNullOrWhiteSpace($hermesHome)) {
-        $hermesHome = Join-Path $env:USERPROFILE '.hermes'
+function Test-SourceReleaseVerification {
+    if (($script:Owner -ne 'Source build') -or (-not $script:UpdateAttempted)) {
+        $script:SourceVerification = 'not attempted'
+        return
     }
+    $issues = @()
+    if (($script:UpdateExit -ne 0) -and ($script:UpdateExit -ne 'not run')) {
+        $issues += "native updater exited $($script:UpdateExit)"
+    }
+    if ($script:InstalledVersionAfter -ne $script:StableTargetVersionBefore) {
+        $issues += "installed version v$($script:InstalledVersionAfter) does not equal selected stable release v$($script:StableTargetVersionBefore)"
+    }
+    if (($script:InstalledVersionAfter -eq 'unknown') -or ($script:InstalledVersionAfter -eq $script:InstalledVersion)) {
+        $issues += "installed version did not advance from v$($script:InstalledVersion) (after=$($script:InstalledVersionAfter))"
+    }
+    if ($script:GitHead -ne $script:StableTargetFullBefore) {
+        $issues += "installed Git revision $($script:GitHead) does not match selected stable revision $($script:StableTargetFullBefore)"
+    }
+    if (($script:GitHead -eq 'unknown') -or ($script:GitHead -eq $script:GitHeadBefore)) {
+        $issues += "Git revision did not advance from $($script:GitHeadBefore) (after=$($script:GitHead))"
+    }
+    if ($script:InstallId -ne $script:InstallIdBefore) {
+        $issues += "installation identity changed: $($script:InstallIdBefore) -> $($script:InstallId)"
+    }
+    if ($script:CanonicalCheckout -ne $script:CheckoutBefore) {
+        $issues += "checkout changed during update: $($script:CheckoutBefore) -> $($script:CanonicalCheckout)"
+    }
+    if ($script:HeremesPath -ne $script:CliPathBefore) {
+        $issues += "Hermes CLI path changed during update: $($script:CliPathBefore) -> $($script:HeremesPath)"
+    }
+    if ($script:StableTargetVersion -ne 'unknown' -and $script:StableTargetVersion -ne $script:StableTargetVersionBefore) {
+        $issues += "stable target changed during execution: v$($script:StableTargetVersionBefore) -> v$($script:StableTargetVersion)"
+    }
+    if (($script:StableTargetShort -ne 'unknown') -and ($script:StableTargetShort -ne $script:StableTargetShortBefore)) {
+        $issues += "stable target revision changed during execution: $($script:StableTargetShortBefore) -> $($script:StableTargetShort)"
+    }
+    if ($script:StableTargetFull -ne 'unknown' -and $script:StableTargetFull -ne $script:StableTargetFullBefore) {
+        $issues += "stable target full revision changed during execution"
+    }
+    if ($script:SourceProvenanceOk -ne 'yes') { $issues += 'official provenance/stable channel is no longer proven after update' }
+    if ($script:GitDirty -ne 'no') { $issues += "checkout dirty after update (state=$($script:GitDirty))" }
+    if ($script:GitIntegrityOk -ne 'yes') { $issues += 'checkout integrity is not proven after update' }
+
+    if ($issues.Count -eq 0) {
+        $script:SourceVerification = 'yes'
+        Add-CheckRow 'Source release verification' 'exact target version and full Git revision, same identity/checkout' `
+            "v$($script:InstalledVersionAfter) @ $($script:GitHead); install=$($script:InstallId); checkout=$($script:CanonicalCheckout)" 'PASS'
+    } else {
+        $script:SourceVerification = 'no'
+        foreach ($issue in $issues) { Add-Degraded 'SOURCE_UPDATE' $issue }
+        Add-CheckRow 'Source release verification' 'exact target version and full Git revision, same identity/checkout' ($issues -join '; ') 'FAIL'
+    }
+}
+
+function Get-UpdateReceipt {
+    param([string]$CorrelationId = '')
+    $hermesHome = Get-HermesHomePath
     $receiptDir = Join-Path $hermesHome 'logs\update_receipts'
     if (-not (Test-Path -LiteralPath $receiptDir -PathType Container)) {
         $script:ReceiptPath = 'none'
-        $script:ReceiptCheck = 'NOT_TESTED'
-        Add-CheckRow 'Update receipt / follow-ups' 'update_*.json present' 'no receipt directory' 'NOT_TESTED'
+        $script:ReceiptCheck = if ($CorrelationId) { 'FAIL' } else { 'NOT_TESTED' }
+        if ($CorrelationId) {
+            Add-Degraded 'RECEIPT' "No update receipt directory exists for correlation '$CorrelationId'."
+        }
+        Add-CheckRow 'Update receipt / follow-ups' 'update_*.json present' 'no receipt directory' $script:ReceiptCheck
         return
     }
-    $latest = Get-ChildItem -LiteralPath $receiptDir -Filter 'update_*.json' -File -ErrorAction SilentlyContinue |
-        Sort-Object -Property LastWriteTime -Descending | Select-Object -First 1
+
+    $receiptFiles = @(Get-ChildItem -LiteralPath $receiptDir -Filter 'update_*.json' -File -ErrorAction SilentlyContinue |
+        Sort-Object -Property LastWriteTime -Descending)
     $latestAnyPath = Join-Path $receiptDir 'latest.json'
-    if (Test-Path -LiteralPath $latestAnyPath -PathType Leaf) {
-        $latestKind = ''
+    $selected = $null
+    $selectedData = $null
+    $parseError = ''
+
+    if (-not [string]::IsNullOrWhiteSpace($CorrelationId)) {
+        foreach ($file in $receiptFiles) {
+            try {
+                $data = Get-Content -LiteralPath $file.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
+                if ($null -ne $data -and ([string]$data.correlation_id) -eq $CorrelationId) {
+                    $selected = $file
+                    $selectedData = $data
+                    break
+                }
+            } catch {
+                $parseError = $_.Exception.Message
+            }
+        }
+        if ($null -eq $selected) {
+            $script:ReceiptPath = 'none'
+            $script:ReceiptCheck = 'FAIL'
+            $script:ReceiptContractValid = 'no'
+            if ($parseError) {
+                Add-Degraded 'RECEIPT' "Update receipt files include an unreadable receipt and none matched correlation '$CorrelationId': $parseError"
+            } else {
+                Add-Degraded 'RECEIPT' "No native update receipt matched operation correlation '$CorrelationId'; historical or unrelated receipts are not current evidence."
+            }
+            Add-CheckRow 'Update receipt / follow-ups' 'exactly one receipt for this operation' "correlation=$CorrelationId; matched=none" 'FAIL'
+            return
+        }
+    } else {
+        $selected = $receiptFiles | Select-Object -First 1
+        if (Test-Path -LiteralPath $latestAnyPath -PathType Leaf) {
+            $latestKind = ''
+            try {
+                $latestAny = Get-Content -LiteralPath $latestAnyPath -Raw -ErrorAction Stop | ConvertFrom-Json
+                $latestKind = [string]$latestAny.kind
+            } catch {
+                $latestKind = 'unreadable'
+            }
+            if (($null -eq $selected) -and ($latestKind -ne 'plugin-check') -and ($latestKind -ne 'unreadable')) {
+                $selected = Get-Item -LiteralPath $latestAnyPath
+            } elseif (($null -ne $selected) -and ($latestKind -ne 'plugin-check') -and ($latestKind -ne 'unreadable') -and
+                      (Get-Item -LiteralPath $latestAnyPath).LastWriteTime -gt $selected.LastWriteTime) {
+                $selected = Get-Item -LiteralPath $latestAnyPath
+            }
+        }
+        if ($null -eq $selected) {
+            $script:ReceiptPath = 'none'
+            $script:ReceiptCheck = 'NOT_TESTED'
+            Add-CheckRow 'Update receipt / follow-ups' 'update_*.json or latest.json present' 'none' 'NOT_TESTED'
+            return
+        }
+    }
+
+    $script:ReceiptPath = $selected.FullName
+    if ($null -eq $selectedData) {
         try {
-            $latestAny = Get-Content -LiteralPath $latestAnyPath -Raw -ErrorAction Stop | ConvertFrom-Json
-            $latestKind = [string]$latestAny.kind
+            $selectedData = Get-Content -LiteralPath $selected.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
         } catch {
-            $latestKind = 'unreadable'
-        }
-        if (($null -eq $latest) -and ($latestKind -ne 'plugin-check') -and ($latestKind -ne 'unreadable')) {
-            $latest = Get-Item -LiteralPath $latestAnyPath
-        } elseif (($null -ne $latest) -and ($latestKind -ne 'plugin-check') -and ($latestKind -ne 'unreadable') -and
-                  (Get-Item -LiteralPath $latestAnyPath).LastWriteTime -gt $latest.LastWriteTime) {
-            $latest = Get-Item -LiteralPath $latestAnyPath
-        }
-    }
-    if ($null -eq $latest) {
-        $script:ReceiptPath = 'none'
-        $script:ReceiptCheck = 'NOT_TESTED'
-        Add-CheckRow 'Update receipt / follow-ups' 'update_*.json or latest.json present' 'none' 'NOT_TESTED'
-        return
-    }
-    $script:ReceiptPath = $latest.FullName
-    try {
-        $data = Get-Content -LiteralPath $latest.FullName -Raw -ErrorAction Stop | ConvertFrom-Json
-        $script:ReceiptOutcome = [string]$data.outcome
-        $followups = @()
-        if ($null -ne $data.followups) { $followups = @($data.followups) }
-        $script:ReceiptFollowupCount = $followups.Count
-        $reasons = @()
-        foreach ($f in $followups) {
-            if ($null -ne $f.reason) { $reasons += [string]$f.reason } else { $reasons += [string]$f }
-        }
-        $script:ReceiptFollowupText = ($reasons -join '; ')
-        if ($null -ne $data.gateway_restart) { $script:ReceiptGatewayIncomplete = [string]$data.gateway_restart.incomplete }
-        if ($null -ne $data.desktop) {
-            if ($null -ne $data.desktop.status) { $script:DesktopBuildState = [string]$data.desktop.status }
-            elseif ($null -ne $data.desktop.result) { $script:DesktopBuildState = [string]$data.desktop.result }
-        }
-        $script:ReceiptFresh = $(if ($latest.LastWriteTime -ge $script:StartedAt.AddSeconds(-5)) { 'yes' } else { 'no' })
-        if (($script:ReceiptFollowupCount -gt 0) -or ($script:ReceiptGatewayIncomplete -eq 'True') -or ($script:ReceiptGatewayIncomplete -eq 'true')) {
             $script:ReceiptCheck = 'FAIL'
-            Add-Degraded 'RECEIPT' "Native update receipt has $($script:ReceiptFollowupCount) unresolved follow-up(s)$(if ($script:ReceiptFollowupText) { ': ' + $script:ReceiptFollowupText })"
-            Add-Confirmed 'Exit code 0 is not treated as success while the receipt records follow-ups.'
-        } elseif ($script:ReceiptOutcome -match '^(?i)(ok|success)$') {
-            $script:ReceiptCheck = 'PASS'
+            $script:ReceiptContractValid = 'no'
+            Add-Degraded 'RECEIPT' "Selected update receipt is unreadable: $($_.Exception.Message)"
+            Add-CheckRow 'Update receipt / follow-ups' 'readable upstream receipt schema' 'unreadable JSON' 'FAIL'
+            return
+        }
+    }
+
+    $issues = @()
+    if ($selectedData -is [System.Array]) {
+        $issues += 'receipt root is an array, not an upstream receipt object'
+    } elseif ($null -eq $selectedData) {
+        $issues += 'receipt is empty'
+    } else {
+        $schema = 0
+        if (-not [int]::TryParse([string]$selectedData.schema, [ref]$schema) -or ($schema -ne 1)) {
+            $issues += "unsupported schema '$($selectedData.schema)'"
+        }
+        $kind = [string]$selectedData.kind
+        if ($kind -eq 'plugin-check') { $issues += 'kind=plugin-check is not an update receipt' }
+        $updateId = [string]$selectedData.update_id
+        if ($updateId -notmatch '^[0-9a-fA-F]{32}$') { $issues += "update_id '$updateId' is not a native update id" }
+        $script:ReceiptCorrelation = [string]$selectedData.correlation_id
+        if ([string]::IsNullOrWhiteSpace($script:ReceiptCorrelation)) { $script:ReceiptCorrelation = 'missing' }
+        if ($CorrelationId -and ($script:ReceiptCorrelation -ne $CorrelationId)) {
+            $issues += "correlation_id '$($script:ReceiptCorrelation)' does not match '$CorrelationId'"
+        }
+        $script:ReceiptOutcome = [string]$selectedData.outcome
+        $finished = [string]$selectedData.finished_at
+        $finishedParsed = [DateTimeOffset]::MinValue
+        if ([string]::IsNullOrWhiteSpace($finished) -or -not [DateTimeOffset]::TryParse($finished, [ref]$finishedParsed)) {
+            $issues += 'finished_at is missing or invalid'
+        }
+        $started = [string]$selectedData.started_at
+        $startedParsed = [DateTimeOffset]::MinValue
+        if ([string]::IsNullOrWhiteSpace($started) -or -not [DateTimeOffset]::TryParse($started, [ref]$startedParsed)) {
+            $issues += 'started_at is missing or invalid'
+        } elseif ($finishedParsed -ne [DateTimeOffset]::MinValue -and $finishedParsed -lt $startedParsed) {
+            $issues += 'finished_at precedes started_at'
+        }
+        $exitCodeProp = $selectedData.PSObject.Properties['exit_code']
+        if (($null -ne $exitCodeProp) -and ([string]$exitCodeProp.Value -ne '0')) {
+            $issues += "exit_code '$($exitCodeProp.Value)' is not zero"
+        }
+
+        $followupProp = $selectedData.PSObject.Properties['followups']
+        if ($null -ne $followupProp) {
+            if ($followupProp.Value -isnot [System.Array]) {
+                $issues += 'followups is not an upstream array'
+                $script:ReceiptFollowupCount = 0
+                $script:ReceiptFollowupText = ''
+            } else {
+                $followups = @($followupProp.Value)
+                $script:ReceiptFollowupCount = $followups.Count
+                $reasons = @()
+                foreach ($f in $followups) {
+                    if ($null -ne $f.reason) { $reasons += [string]$f.reason } else { $reasons += [string]$f }
+                    if (([string]$f.step) -in @('launchers', 'build', 'completion')) { $script:ReceiptBuildFailure = 'yes' }
+                }
+                $script:ReceiptFollowupText = ($reasons -join '; ')
+            }
         } else {
-            $script:ReceiptCheck = 'FAIL'
-            Add-Degraded 'RECEIPT' "Native update receipt outcome is '$($script:ReceiptOutcome)'."
+            $script:ReceiptFollowupCount = 0
+            $script:ReceiptFollowupText = ''
         }
-        Add-CheckRow 'Update receipt / follow-ups' 'outcome ok/success, no follow-ups' `
-            "outcome=$($script:ReceiptOutcome) followups=$($script:ReceiptFollowupCount) gateway_incomplete=$($script:ReceiptGatewayIncomplete) fresh=$($script:ReceiptFresh) build=$($script:DesktopBuildState)" $script:ReceiptCheck
-        Add-Timeline 'RECEIPT' "read $($latest.FullName)" $script:ReceiptOutcome (Limit-Text $script:ReceiptFollowupText 4 400)
-    } catch {
-        $script:ReceiptCheck = 'FAIL'
-        Add-Degraded 'RECEIPT' "Newest update receipt is unreadable: $($_.Exception.Message)"
+
+        if ($null -ne $selectedData.gateway_restart) {
+            $gateway = $selectedData.gateway_restart
+            if ($gateway -isnot [System.Management.Automation.PSCustomObject]) {
+                $issues += 'gateway_restart is not an object'
+            } else {
+                $incompleteProp = $gateway.PSObject.Properties['incomplete']
+                if (($null -eq $incompleteProp) -or ($incompleteProp.Value -isnot [bool])) {
+                    $issues += 'gateway_restart.incomplete is missing or not boolean'
+                } else {
+                    $script:ReceiptGatewayIncomplete = [string]$incompleteProp.Value
+                }
+            }
+        } else {
+            $issues += 'gateway_restart is missing'
+            $script:ReceiptGatewayIncomplete = 'missing'
+        }
+
+        if ($null -ne $selectedData.desktop) {
+            if ($null -ne $selectedData.desktop.status) { $script:DesktopBuildState = [string]$selectedData.desktop.status }
+            elseif ($null -ne $selectedData.desktop.result) { $script:DesktopBuildState = [string]$selectedData.desktop.result }
+        }
+        $stagesProp = $selectedData.PSObject.Properties['stages']
+        if ($null -ne $stagesProp -and $stagesProp.Value -is [System.Array]) {
+            foreach ($stage in @($stagesProp.Value)) {
+                if ([string]$stage.name -eq 'build') {
+                    if ([string]$stage.outcome -eq 'failed') { $script:ReceiptBuildFailure = 'yes' }
+                }
+            }
+        }
+        $argvProp = $selectedData.PSObject.Properties['argv']
+        if ($null -ne $argvProp) {
+            if ($argvProp.Value -isnot [System.Array]) {
+                $issues += 'argv is not an array'
+            } else {
+                $argv = @($argvProp.Value | ForEach-Object { [string]$_ })
+                if (($argv -notcontains 'update') -or (($argv -notcontains '--yes') -and ($argv -notcontains '-y'))) {
+                    $issues += 'argv does not prove the native update --yes command'
+                }
+            }
+        }
+
+        if ($CorrelationId) {
+            if (($null -eq $selectedData.post_update) -or ($selectedData.post_update -isnot [System.Management.Automation.PSCustomObject])) {
+                $issues += 'post_update completion evidence is missing'
+            } else {
+                $postSha = [string]$selectedData.post_update.sha
+                $postVersion = [string]$selectedData.post_update.version
+                $postSource = [string]$selectedData.post_update.source
+                if (($postSha -notmatch '^[0-9a-fA-F]{40}$') -or ($postSha.ToLowerInvariant() -ne $script:StableTargetFullBefore)) {
+                    $issues += "post_update.sha '$postSha' does not equal target '$($script:StableTargetFullBefore)'"
+                }
+                if ($postVersion -ne $script:StableTargetVersionBefore) {
+                    $issues += "post_update.version '$postVersion' does not equal target '$($script:StableTargetVersionBefore)'"
+                }
+                if ($postSource -ne 'git') {
+                    $issues += "post_update.source '$postSource' is not a managed Git source"
+                }
+            }
+            if (($null -ne $selectedData.pre_update) -and ($selectedData.pre_update -is [System.Management.Automation.PSCustomObject])) {
+                $preSha = [string]$selectedData.pre_update.sha
+                if ($preSha -ne $script:GitHeadBefore) {
+                    $issues += "pre_update.sha '$preSha' does not match pre-update HEAD '$($script:GitHeadBefore)'"
+                }
+            } else {
+                $issues += 'pre_update identity is missing'
+            }
+        }
     }
+
+    $script:ReceiptContractValid = if ($issues.Count -eq 0) { 'yes' } else { 'no' }
+    if ($script:ReceiptOutcome -notmatch '^(?i)(ok|success)$') {
+        $issues += "outcome '$($script:ReceiptOutcome)' is not success"
+    }
+    if (($script:ReceiptFollowupCount -gt 0) -or ($script:ReceiptGatewayIncomplete -eq 'True') -or ($script:ReceiptGatewayIncomplete -eq 'true')) {
+        $issues += "receipt has $($script:ReceiptFollowupCount) unresolved follow-up(s)$(if ($script:ReceiptFollowupText) { ': ' + $script:ReceiptFollowupText }) and gateway_restart.incomplete=$($script:ReceiptGatewayIncomplete)"
+    }
+    if ($CorrelationId -and ($script:ReceiptCorrelation -ne $CorrelationId)) {
+        $issues += "receipt correlation '$($script:ReceiptCorrelation)' does not match operation '$CorrelationId'"
+    }
+
+    if ($CorrelationId) { $script:ReceiptFresh = 'yes' }
+    else { $script:ReceiptFresh = $(if ($selected.LastWriteTime -ge $script:StartedAt.AddSeconds(-5)) { 'yes' } else { 'no' }) }
+
+    if ($issues.Count -eq 0) {
+        $script:ReceiptCheck = 'PASS'
+    } else {
+        $script:ReceiptCheck = 'FAIL'
+        foreach ($issue in $issues) {
+            if ($issue -match '(?i)follow-up|gateway_restart\.incomplete') {
+                Add-Degraded 'RECEIPT' "Native update receipt: $issue"
+            } elseif ($issue -match '(?i)correlation') {
+                Add-Degraded 'RECEIPT' "Native receipt correlation mismatch: $issue"
+            } else {
+                Add-Degraded 'RECEIPT' "Native update receipt contract failed: $issue"
+            }
+        }
+    }
+    Add-CheckRow 'Update receipt / follow-ups' 'current correlated terminal success, zero follow-ups, gateway complete' `
+        "correlation=$($script:ReceiptCorrelation); outcome=$($script:ReceiptOutcome) followups=$($script:ReceiptFollowupCount) gateway_incomplete=$($script:ReceiptGatewayIncomplete) fresh=$($script:ReceiptFresh) build_failure=$($script:ReceiptBuildFailure)" $script:ReceiptCheck
+    Add-Timeline 'RECEIPT' "read $($selected.FullName)" $script:ReceiptOutcome (Limit-Text $script:ReceiptFollowupText 4 400)
 }
 
 # ---------------------------------------------------------------------------
@@ -1170,11 +1591,21 @@ function Invoke-SourceUpdate {
         return
     }
     Get-SourceVersion
+    Get-SourceUpdateAvailability
+    Get-SourceInstallIdentity
     Test-SourceProvenance
-    if ($script:SourceProvenanceOk -ne 'yes') {
-        Add-Block 'PRECHECK' 'Source provenance is not proven immediately before update; refusing to run the source updater.'
+    if (($script:SourceProvenanceOk -ne 'yes') -or ($script:SourceChannel -ne 'stable') -or ($script:UpdateCheckChannel -ne 'stable')) {
+        Add-Block 'PRECHECK' 'Source provenance or stable channel is not proven immediately before update; refusing to run the source updater.'
         return
     }
+    if ($script:UpdateAvailable -ne 'yes') {
+        Add-Block 'PRECHECK' "No verified stable update is available (state=$($script:UpdateAvailable)); refusing to invoke the updater."
+        return
+    }
+    if (-not (Resolve-SourceTargetRevision)) {
+        return
+    }
+
     $planExit = Invoke-Native $script:HeremesPath @('update', '--plan')
     Add-Timeline 'WINDOWS_PACKAGE' 'hermes update --plan' "exit $planExit" (($script:NativeOutput -split "`r?`n" | Select-Object -First 8) -join ' ')
     Add-Evidence "Update plan: $(Limit-Text $script:NativeOutput 10 900)"
@@ -1182,36 +1613,131 @@ function Invoke-SourceUpdate {
         Add-Block 'PRECHECK' "hermes update --plan failed (exit $planExit); refusing to update blindly."
         return
     }
+    $planInstall = [regex]::Match($script:NativeOutput, '(?im)^\s*Install:\s*git\s+\(v(?<version>\d+\.\d+\.\d+)\s+@\s+(?<sha>[0-9a-fA-F]{7,40})\)')
+    if ($planInstall.Success) {
+        $planSha = $planInstall.Groups['sha'].Value.ToLowerInvariant()
+        if (-not $script:GitHead.StartsWith($planSha)) {
+            Add-Block 'PRECHECK' "Update plan revision $planSha does not match the installed Git HEAD $($script:GitHead)."
+            return
+        }
+    }
 
-    $updateArgs = @('update', '--set-channel', 'stable', '--yes')
+    Capture-SourceBaseline
+    $script:UpdateCorrelationId = 'hermes-ops-win-' + [guid]::NewGuid().ToString('N')
+    $updateArgs = @('update', '--yes')
     if ($NoBackup) { $updateArgs += '--no-backup' }
     $script:UpdateAttempted = $true
     $script:UpdateNeeded = $true
-    Add-Timeline 'WINDOWS_PACKAGE' ("hermes " + ($updateArgs -join ' ')) 'started' 'single official updater invocation'
-    $exit = Invoke-Native $script:HeremesPath $updateArgs
+    Add-Timeline 'WINDOWS_PACKAGE' ("hermes " + ($updateArgs -join ' ')) 'started' "single official updater invocation; correlation=$($script:UpdateCorrelationId)"
+    $hadCorrelation = Test-Path Env:HERMES_UPDATE_CORRELATION_ID
+    $previousCorrelation = $env:HERMES_UPDATE_CORRELATION_ID
+    try {
+        $env:HERMES_UPDATE_CORRELATION_ID = $script:UpdateCorrelationId
+        $exit = Invoke-Native $script:HeremesPath $updateArgs
+    } finally {
+        if ($hadCorrelation) {
+            $env:HERMES_UPDATE_CORRELATION_ID = $previousCorrelation
+        } else {
+            Remove-Item Env:HERMES_UPDATE_CORRELATION_ID -ErrorAction SilentlyContinue
+        }
+    }
     $script:UpdateExit = $exit
     $script:UpdateOutput = $script:NativeOutput
     $script:Mutations = 'hermes ' + ($updateArgs -join ' ')
     Add-Timeline 'WINDOWS_PACKAGE' ("hermes " + ($updateArgs -join ' ')) "exit $exit" (Limit-Text $script:UpdateOutput 8 600)
     Add-Evidence "Updater output (bounded): $(Limit-Text $script:UpdateOutput 20 1200)"
+}
 
-    $versionExit = Invoke-Native $script:HeremesPath @('--version')
-    if ($versionExit -eq 0) {
-        $m = [regex]::Match($script:NativeOutput, 'v?(\d+\.\d+\.\d+)')
-        if ($m.Success) { $script:InstalledVersionAfter = $m.Groups[1].Value }
-    }
+function Get-DesktopReleaseRoot {
+    if ([string]::IsNullOrWhiteSpace($script:SourceCheckout)) { return '' }
+    return (Join-Path $script:SourceCheckout 'apps\desktop\release')
+}
 
-    $needsDesktopRepair = $false
-    if ($script:UpdateOutput -match '(?i)desktop.*(fail|missing|not built|build error)') { $needsDesktopRepair = $true }
-    if ($script:DesktopBuildState -match '(?i)fail|missing|error') { $needsDesktopRepair = $true }
-    if ($needsDesktopRepair) {
-        Add-Warning 'Updater output/receipt indicates a missing or failed Desktop build; running the documented headless repair only.'
-        $repairExit = Invoke-Native $script:HeremesPath @('desktop', '--build-only', '--force-build')
-        $script:DesktopRepairRun = 'yes'
-        $script:DesktopRepairResult = "exit $repairExit"
-        $script:Mutations = $script:Mutations + '; hermes desktop --build-only --force-build'
-        Add-Timeline 'WINDOWS_PACKAGE' 'hermes desktop --build-only --force-build' "exit $repairExit" (Limit-Text $script:NativeOutput 8 500)
+function Test-DesktopBuildArtifact {
+    if ($script:Owner -ne 'Source build') { return }
+    $desktopDir = Join-Path $script:SourceCheckout 'apps\desktop'
+    if (-not (Test-Path -LiteralPath $desktopDir -PathType Container)) {
+        $script:DesktopBuildExpected = 'no'
+        $script:DesktopBuildVerified = 'not applicable'
+        $script:DesktopBuildState = 'not applicable'
+        Add-CheckRow 'Desktop build' 'source Desktop present' 'no Desktop workspace in checkout' 'NOT_TESTED'
+        return
     }
+    $script:DesktopBuildExpected = 'yes'
+    $releaseRoot = Get-DesktopReleaseRoot
+    $candidates = @('win-unpacked', 'win-arm64-unpacked', 'win-ia32-unpacked')
+    $matching = @()
+    $observed = @()
+    foreach ($name in $candidates) {
+        $root = Join-Path $releaseRoot $name
+        $exe = Join-Path $root 'Hermes.exe'
+        $stampPath = Join-Path $root 'resources\install-stamp.json'
+        if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { continue }
+        $observed += "$name (no current stamp)"
+        if (-not (Test-Path -LiteralPath $stampPath -PathType Leaf)) { continue }
+        try {
+            $stamp = Get-Content -LiteralPath $stampPath -Raw -ErrorAction Stop | ConvertFrom-Json
+            $commit = [string]$stamp.commit
+            if (($commit -match '^[0-9a-fA-F]{40}$') -and ($commit.ToLowerInvariant() -eq $script:StableTargetFullBefore)) {
+                $matching += $root
+                $observed += "$name (commit=$commit)"
+            } else {
+                $observed += "$name (stale commit=$commit)"
+            }
+        } catch {
+            $observed += "$name (unreadable stamp)"
+        }
+    }
+    if ($matching.Count -ge 1) {
+        $script:DesktopBuildVerified = 'verified'
+        $script:DesktopBuildState = 'verified'
+        $script:DesktopArtifactPath = $matching[0]
+        Add-CheckRow 'Desktop build' 'packaged app stamped at exact target commit' "verified; $($matching[0])" 'PASS'
+    } else {
+        $script:DesktopBuildVerified = 'unverified'
+        $script:DesktopBuildState = 'unverified'
+        Add-CheckRow 'Desktop build' 'packaged app stamped at exact target commit' (($observed -join '; ') -replace '^$', 'no packaged app artifact') 'FAIL'
+    }
+}
+
+function Test-DesktopBuildUnlocked {
+    $releaseRoot = Get-DesktopReleaseRoot
+    if ([string]::IsNullOrWhiteSpace($releaseRoot)) { return $false }
+    try {
+        $holders = @()
+        foreach ($process in @(Get-Process -ErrorAction Stop)) {
+            try { $processPath = $process.Path } catch { continue }
+            if ($processPath -and ($processPath.StartsWith($releaseRoot, [StringComparison]::OrdinalIgnoreCase))) {
+                $holders += $process
+            }
+        }
+    } catch {
+        Add-Degraded 'WINDOWS_PACKAGE' "Desktop build output locks could not be checked: $($_.Exception.Message)"
+        return $false
+    }
+    if ($holders.Count -gt 0) {
+        $details = (($holders | Select-Object -First 5 | ForEach-Object { "pid=$($_.Id) path=$($_.Path)" }) -join '; ')
+        Add-Degraded 'WINDOWS_PACKAGE' "A running Desktop process is holding Desktop build output ($details); no repair or process kill was performed."
+        return $false
+    }
+    return $true
+}
+
+function Invoke-DesktopRepairIfNeeded {
+    if (($script:Owner -ne 'Source build') -or (-not $script:UpdateAttempted)) { return }
+    if (($script:UpdateExit -ne 0) -or ($script:SourceVerification -ne 'yes')) { return }
+    if (($script:ReceiptContractValid -ne 'yes') -or ($script:ReceiptOutcome -notmatch '^(?i)(ok|success)$')) { return }
+    $evidence = $false
+    if ($script:ReceiptBuildFailure -eq 'yes') { $evidence = $true }
+    if ($script:UpdateOutput -match '(?i)Desktop app build owed|desktop[^\r\n]*(fail|missing|not built|build error)') { $evidence = $true }
+    if (-not $evidence) { return }
+    if (-not (Test-DesktopBuildUnlocked)) { return }
+    Add-Warning 'Current-operation receipt/output proves the native update completed but the Desktop build is owed; running the documented headless repair once.'
+    $repairExit = Invoke-Native $script:HeremesPath @('desktop', '--build-only', '--force-build')
+    $script:DesktopRepairRun = 'yes'
+    $script:DesktopRepairResult = "exit $repairExit"
+    $script:Mutations = $script:Mutations + '; hermes desktop --build-only --force-build'
+    Add-Timeline 'WINDOWS_PACKAGE' 'hermes desktop --build-only --force-build' "exit $repairExit" (Limit-Text $script:NativeOutput 8 500)
 }
 
 function Invoke-StoreUpdate {
@@ -1400,12 +1926,26 @@ function Set-UpdateVerdict {
     $problems = 0
     $updaterFailed = $false
     if ($script:Blocks.Count -gt 0) {
-        $script:Status = 'BLOCKED'
-        $script:ExitCode = 2
-        $script:Summary = ($script:Blocks[0] -split '\|', 2)[1]
-        Add-Unknown 'No update was attempted after the blocker; the pre-existing package state remains.'
+        if ($script:UpdateAttempted -and ($script:Owner -eq 'Source build')) {
+            if (($script:UpdateExit -ne 0) -and ($script:UpdateExit -ne 'not run')) {
+                $script:Status = 'FAILED'
+                $script:Summary = "Native updater exited $($script:UpdateExit); post-update verification also found: $(($script:Blocks[0] -split '\|', 2)[1])"
+            } else {
+                $script:Status = 'PARTIAL'
+                $script:Summary = "Update ran, but post-update verification found: $(($script:Blocks[0] -split '\|', 2)[1])"
+            }
+            $script:ExitCode = 1
+        } else {
+            $script:Status = 'BLOCKED'
+            $script:ExitCode = 2
+            $script:Summary = ($script:Blocks[0] -split '\|', 2)[1]
+            if (-not $script:UpdateAttempted) {
+                Add-Unknown 'No update was attempted after the blocker; the pre-existing package state remains.'
+            }
+        }
         return
     }
+
     if ($script:UpdateAttempted) {
         if (($script:UpdateExit -ne 0) -and ($script:UpdateExit -ne 'not run') -and ($script:DistributorState -ne 'NO_APPLICABLE_UPGRADE')) {
             $problems++
@@ -1423,13 +1963,21 @@ function Set-UpdateVerdict {
             Add-Degraded 'WINDOWS_PACKAGE' "Post-update package verification is '$($script:PostPackageVerified)', not verified success."
         }
         if ($script:Owner -eq 'Source build') {
-            if ($script:ReceiptCheck -ne 'PASS') {
+            if ($script:SourceVerification -ne 'yes') {
                 $problems++
-                Add-Degraded 'RECEIPT' 'Native source update receipt is not a clean success.'
+                Add-Degraded 'SOURCE_UPDATE' "Exact source release verification is '$($script:SourceVerification)', not verified success."
             }
-            if ($script:ReceiptFresh -ne 'yes') {
+            if (($script:ReceiptContractValid -ne 'yes') -or ($script:ReceiptCheck -ne 'PASS')) {
                 $problems++
-                Add-Degraded 'RECEIPT' 'No fresh native update receipt was produced by this run.'
+                Add-Degraded 'RECEIPT' 'Native source update receipt is not a clean, complete, correlated success.'
+            }
+            if (([string]::IsNullOrWhiteSpace($script:UpdateCorrelationId)) -or ($script:ReceiptCorrelation -ne $script:UpdateCorrelationId)) {
+                $problems++
+                Add-Degraded 'RECEIPT' "Receipt correlation '$($script:ReceiptCorrelation)' does not match current operation '$($script:UpdateCorrelationId)'."
+            }
+            if ($script:DesktopBuildVerified -ne 'verified') {
+                $problems++
+                Add-Degraded 'WINDOWS_PACKAGE' "Desktop build verification is '$($script:DesktopBuildVerified)', not verified."
             }
             if ($script:DesktopRepairRun -eq 'yes' -and $script:DesktopRepairResult -ne 'exit 0') {
                 $problems++
@@ -1443,27 +1991,35 @@ function Set-UpdateVerdict {
     } elseif ($script:HttpState -ne 'PASS') {
         $problems++
         Add-Degraded 'PROTOCOL' "Post-update backend HTTP check is '$($script:HttpState)' (HTTP $($script:HttpCode))."
+    } elseif ($script:BackendHealthState -ne 'PASS') {
+        $problems++
+        Add-Degraded 'PROTOCOL' "Post-update backend health is '$($script:BackendHealthState)' (overall=$($script:HttpOverall))."
     }
     if ($script:WebSocketState -ne 'PASS') {
         Add-Unknown 'Authenticated WebSocket/session remains NOT_TESTED; HTTP success is not Desktop connection proof.'
     }
+    if ($script:Degraded.Count -gt 0) { $problems++ }
 
     if ($updaterFailed) {
         $script:Status = 'FAILED'
         $script:ExitCode = 1
         $script:Summary = "Owner-specific updater exited $($script:UpdateExit); no retry was attempted and verification is incomplete."
-    } elseif ($problems -eq 0) {
-        if ($script:UpdateAttempted -and ($script:UpdateExit -ne 'not run')) {
-            $script:Status = 'UPDATED'
-        } else {
-            $script:Status = 'ALREADY_CURRENT'
-        }
+    } elseif ($script:UpdateAttempted -and ($script:UpdateExit -eq 0) -and ($problems -eq 0)) {
+        $script:Status = 'UPDATED'
         $script:ExitCode = 0
-        $script:Summary = 'Owner-specific update path and locally verifiable checks passed.'
+        $script:Summary = 'Native stable source update and all independently verifiable checks passed.'
+    } elseif ($script:UpdateAttempted) {
+        $script:Status = 'PARTIAL'
+        $script:ExitCode = 1
+        $script:Summary = 'The owner-specific update ran, but one or more exact-release/receipt/Desktop/remote checks remain unresolved.'
+    } elseif ($problems -eq 0) {
+        $script:Status = 'ALREADY_CURRENT'
+        $script:ExitCode = 0
+        $script:Summary = 'No update was available; all verified checks passed.'
     } else {
         $script:Status = 'PARTIAL'
         $script:ExitCode = 1
-        $script:Summary = 'The owner-specific update may have run, but one or more package/receipt/remote checks remain unresolved.'
+        $script:Summary = 'No update was available, but pre-existing degradation remains (no mutation).'
     }
 }
 
@@ -1523,9 +2079,14 @@ function Get-NextAction {
             }
         }
         'RECEIPT' {
+            $receiptCommand = if (($script:ReceiptPath -ne 'none') -and (Test-Path -LiteralPath $script:ReceiptPath)) {
+                'Get-Content ''' + $script:ReceiptPath + ''' -Raw | ConvertFrom-Json'
+            } else {
+                'Get-ChildItem "$env:HERMES_HOME\logs\update_receipts\update_*.json" | Sort-Object LastWriteTime -Descending | Select-Object -First 1'
+            }
             return @{
-                Action = 'Read the native receipt follow-ups and complete the exact deferred step; exit code 0 alone is not success.'
-                Command = 'Get-Content "$env:USERPROFILE\.hermes\logs\update_receipts\latest.json" -Raw | ConvertFrom-Json'
+                Action = 'Read the correlated native receipt and complete the exact deferred step; exit code 0 alone is not success.'
+                Command = $receiptCommand
                 Permission = 'No; reading evidence only.'
             }
         }
@@ -1573,7 +2134,9 @@ function Write-Report {
     [void]$sb.AppendLine("| Hermes executable path | $(ConvertTo-MdCell $script:HeremesPath) |")
     [void]$sb.AppendLine("| Installation type / Windows package owner | $(ConvertTo-MdCell $script:Owner) / $(ConvertTo-MdCell $script:SignatureKind) |")
     [void]$sb.AppendLine("| Installed version before/after | v$(ConvertTo-MdCell $script:InstalledVersion) / $(ConvertTo-MdCell $versionAfter) |")
-    [void]$sb.AppendLine("| Upstream stable target / distributor channel | v$(ConvertTo-MdCell $script:AvailableVersion) / $(ConvertTo-MdCell $script:DistributorState) |")
+    [void]$sb.AppendLine("| Upstream stable target / full revision | v$(ConvertTo-MdCell $script:StableTargetVersion) ($(ConvertTo-MdCell $script:StableTargetFull)) / $(ConvertTo-MdCell $script:DistributorState) |")
+    [void]$sb.AppendLine("| Installation identity / canonical checkout | $(ConvertTo-MdCell $script:InstallId) / $(ConvertTo-MdCell $script:CanonicalCheckout) |")
+    [void]$sb.AppendLine("| Desktop build verification | $(ConvertTo-MdCell $script:DesktopBuildVerified); artifact=$(ConvertTo-MdCell $script:DesktopArtifactPath); repair=$(ConvertTo-MdCell $script:DesktopRepairRun)/$(ConvertTo-MdCell $script:DesktopRepairResult) |")
     [void]$sb.AppendLine("| Backend URL (no userinfo or tokens) | $(ConvertTo-MdCell $script:BackendUrlDisplay) ($(ConvertTo-MdCell $script:BackendUrlSource)) |")
     [void]$sb.AppendLine("| Mutations actually made | $(ConvertTo-MdCell $script:Mutations) |")
     [void]$sb.AppendLine('')
@@ -1582,6 +2145,18 @@ function Write-Report {
     [void]$sb.AppendLine('| Check | Expected | Actual | PASS/FAIL/NOT_TESTED |')
     [void]$sb.AppendLine('|---|---|---|---|')
     foreach ($row in $script:CheckRows) { [void]$sb.AppendLine($row) }
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine('**Outcome separation (never collapsed into one success claim):**')
+    [void]$sb.AppendLine('')
+    [void]$sb.AppendLine("| Dimension | Result | Evidence |")
+    [void]$sb.AppendLine("|---|---|---|")
+    [void]$sb.AppendLine("| Windows source installation updated | $(ConvertTo-MdCell $script:SourceVerification) | v$($script:InstalledVersionAfter) @ $($script:GitHead) vs target v$($script:StableTargetVersionBefore) @ $($script:StableTargetFullBefore) |")
+    [void]$sb.AppendLine("| Desktop build | $(ConvertTo-MdCell $script:DesktopBuildVerified) | $(ConvertTo-MdCell $script:DesktopBuildState); $(ConvertTo-MdCell $script:DesktopArtifactPath) |")
+    [void]$sb.AppendLine("| Remote backend reachable | $(ConvertTo-MdCell $script:HttpState) | HTTP $(ConvertTo-MdCell $script:HttpCode); protocol=$(ConvertTo-MdCell $script:HttpProtocol) |")
+    [void]$sb.AppendLine("| Remote backend healthy | $(ConvertTo-MdCell $script:BackendHealthState) | overall=$(ConvertTo-MdCell $script:HttpOverall); version=$(ConvertTo-MdCell $script:HttpVersion) |")
+    [void]$sb.AppendLine("| Authentication advertised | $(ConvertTo-MdCell $script:AuthState) | auth_required=$(ConvertTo-MdCell $script:HttpAuthRequired) |")
+    [void]$sb.AppendLine("| Authenticated Desktop session actually tested | NO / NOT_TESTED | No approved credential path was used. |")
+    [void]$sb.AppendLine("| WebSocket actually tested | $(ConvertTo-MdCell $script:WebSocketState) | Never inferred from HTTP status. |")
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine('## 4. Timeline and last successful step')
     [void]$sb.AppendLine('')
@@ -1599,7 +2174,7 @@ function Write-Report {
     [void]$sb.AppendLine('## 5. Exact errors and references')
     [void]$sb.AppendLine('')
     [void]$sb.AppendLine("- **Error text (redacted, concise):** $(ConvertTo-MdCell $script:Summary)")
-    [void]$sb.AppendLine("- **Hermes receipt:** ``$(ConvertTo-MdCell $script:ReceiptPath)``; outcome=``$(ConvertTo-MdCell $script:ReceiptOutcome)``; followups=$($script:ReceiptFollowupCount); gateway_restart.incomplete=$(ConvertTo-MdCell $script:ReceiptGatewayIncomplete); fresh=$(ConvertTo-MdCell $script:ReceiptFresh)")
+    [void]$sb.AppendLine("- **Hermes receipt:** ``$(ConvertTo-MdCell $script:ReceiptPath)``; correlation=``$(ConvertTo-MdCell $script:ReceiptCorrelation)``; operation=``$(ConvertTo-MdCell $script:UpdateCorrelationId)``; outcome=``$(ConvertTo-MdCell $script:ReceiptOutcome)``; followups=$($script:ReceiptFollowupCount); gateway_restart.incomplete=$(ConvertTo-MdCell $script:ReceiptGatewayIncomplete); contract=$(ConvertTo-MdCell $script:ReceiptContractValid); build_failure=$(ConvertTo-MdCell $script:ReceiptBuildFailure); fresh=$(ConvertTo-MdCell $script:ReceiptFresh)")
     if ($script:ReceiptFollowupText) {
         [void]$sb.AppendLine("- **Receipt follow-up detail:** $(ConvertTo-MdCell $script:ReceiptFollowupText)")
     }
@@ -1711,7 +2286,10 @@ function Main {
 
     if ($script:Owner -eq 'Source build') {
         Get-SourceUpdateAvailability
+        Get-SourceInstallIdentity
         Test-SourceProvenance
+        if ($script:UpdateAvailable -eq 'yes') { [void](Resolve-SourceTargetRevision) }
+        Capture-SourceBaseline
     } elseif ($script:Owner -eq 'Microsoft Store') {
         Get-StoreUpdateAvailability
     } elseif ($script:Owner -eq 'Sideload MSIX') {
@@ -1721,7 +2299,9 @@ function Main {
     Test-BackendNetwork
     Invoke-StatusProbe
     if ($script:Owner -eq 'Source build') {
-        Get-UpdateReceipt
+        if ($script:Operation -eq 'check') {
+            Get-UpdateReceipt
+        }
     } else {
         $script:ReceiptPath = 'not applicable (package owner)'
         Add-CheckRow 'Update receipt / follow-ups' 'source receipt applies only to source builds' 'distributor-owned package' 'NOT_TESTED'
@@ -1794,8 +2374,20 @@ function Main {
     # Re-read package state and the remote endpoint after mutation.
     Get-AppxInfo -AfterUpdate
     if ($script:Owner -eq 'Source build') {
+        Get-HermesCommandInfo
         Get-SourceVersion -AfterUpdate
-        Get-UpdateReceipt
+        Get-SourceInstallIdentity -AfterUpdate
+        Get-SourceUpdateAvailability -AfterUpdate
+        Test-SourceProvenance -AfterUpdate
+        Test-SourceReleaseVerification
+        if ($script:UpdateAttempted) {
+            Get-UpdateReceipt -CorrelationId $script:UpdateCorrelationId
+            Test-DesktopBuildArtifact
+            Invoke-DesktopRepairIfNeeded
+            if ($script:DesktopRepairRun -eq 'yes') { Test-DesktopBuildArtifact }
+        } else {
+            Get-UpdateReceipt
+        }
     }
     Test-PostUpdatePackage
     Test-BackendNetwork

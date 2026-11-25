@@ -331,13 +331,17 @@ hermes update --plan
 hermes update --yes
 ```
 
-Add `--no-backup` only if explicitly selected. Check `$LASTEXITCODE` after **every** external command. The source updater can rebuild Desktop as part of its own pipeline. Use the terminal-only repair:
+Add `--no-backup` only if explicitly selected. Check `$LASTEXITCODE` after **every** external command. Before mutation, resolve the selected stable target to one full Git commit and capture the native install id, installed version, full Git HEAD, canonical checkout, official provenance and stable channel. Resolve the full target locally when the release object exists; otherwise resolve the immutable release tag from the already-verified official origin with `git ls-remote`, requiring the returned full SHA to match the native short SHA. If any target/revision identity is ambiguous, **BLOCKED** before invoking the updater. After mutation, require the CLI version and full Git HEAD to equal that exact target, and the install id, checkout, provenance, channel, integrity and cleanliness to remain unchanged; version advancement alone is not success.
+
+For every attempted source update, generate one operation correlation id and scope it to the updater with `HERMES_UPDATE_CORRELATION_ID`, restoring any prior value afterward. Select only the terminal `update_*.json` receipt whose `correlation_id` matches this operation. A newer unrelated `latest.json`, a plugin-check artifact, a historical receipt, malformed/incomplete schema, failed outcome, unresolved `followups[]`, or `gateway_restart.incomplete=true` is non-success. Do not rewrite or delete native receipts.
+
+The source updater can rebuild Desktop as part of its own pipeline. Use the terminal-only repair:
 
 ```powershell
 hermes desktop --build-only --force-build
 ```
 
-**only if** upstream output/receipt indicates a missing or failed Desktop build, and the source app is no longer holding the build output files. This option builds without launching Desktop. Do not run `hermes desktop` alone, which can open the GUI. Inspect native receipt `followups` and `desktop` build result.
+**only if** the current operation's output/receipt proves a missing or failed Desktop build, the native update completed successfully, and the source app is no longer holding the build output files. This option builds without launching Desktop. Do not run `hermes desktop` alone, which can open the GUI. Historical receipt state cannot authorize a new repair. Independently verify the packaged artifact's install stamp names the exact target commit; otherwise Desktop remains `unverified`/`failed` and the update is not `UPDATED`.
 
 ### B. Microsoft Store Desktop
 
@@ -361,10 +365,10 @@ Re-read `Get-AppxPackage` and the Store upgrade listing. Handle WinGet's `NO_APP
 
 - Package/CLI version before/after and distributor-specific “current” status.
 - For Store/sideload updates, verify exactly one supported package remains installed with the expected identity, publisher, and ownership; the version must be valid, non-downgraded, advanced when required, and at least the validated sideload descriptor target. Missing, ambiguous, invalid, or unchanged packages are non-success.
-- When source-built, native Hermes diagnostics + latest receipt with no required follow-ups.
+- When source-built, native Hermes diagnostics plus the **current operation's correlated receipt**, never an unrelated newer `latest.json`, with no required follow-ups. Keep these verdicts separate: Windows source installation updated; Desktop build verified or unverified; remote backend reachable; remote backend healthy (`overall=ok`); authentication advertised; authenticated Desktop session actually tested; WebSocket actually tested.
 - No unwanted Desktop GUI launch.
 - Remote URL host resolves and the VM HTTP endpoint responds with Hermes JSON.
-- Authenticated WebSocket **only if truly tested**; HTTP-only success is not “Desktop connected.”
+- Authenticated WebSocket **only if truly tested**; HTTP-only success is not “Desktop connected.” Never require Windows and Linux versions to match unless upstream states that compatibility constraint.
 
 ---
 
@@ -503,6 +507,14 @@ All values in this example are **hypothetical**. Reports must always use actual 
 - [ ] Running GUI lock results in targeted diagnosis, not blanket process termination.
 - [ ] No GUI opened; source Desktop rebuild is headless and conditional.
 - [ ] Tailscale/network/HTTP/WS status each reported separately.
+- [ ] Source update resolves the selected stable version to one full target commit before mutation; unresolved/ambiguous target blocks.
+- [ ] Post-update version and full Git revision must both equal the pre-update target; unchanged or wrong version/revision is non-success.
+- [ ] Installation id, canonical checkout, official provenance, stable channel and checkout cleanliness are re-verified after mutation.
+- [ ] Each source update carries a unique `HERMES_UPDATE_CORRELATION_ID`; only the matching terminal receipt is current evidence.
+- [ ] Correlated receipt survives a newer unrelated `latest.json`; missing/mismatched/historical/plugin/malformed/failed receipts are non-success.
+- [ ] Receipt follow-ups or `gateway_restart.incomplete=true` are `PARTIAL`, never `UPDATED`.
+- [ ] Desktop repair runs only from current-operation evidence after a successful native update, and never while a process holds build output.
+- [ ] Desktop build, backend reachable/healthy, auth advertised, authenticated session and WebSocket remain distinct outcomes.
 
 ### E2E checks on the user's real deployment (required)
 

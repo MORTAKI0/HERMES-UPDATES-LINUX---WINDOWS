@@ -15,6 +15,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $RepoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..\..')).Path
 $ScriptPath = Join-Path $RepoRoot 'skills\hermes-windows\scripts\hermes.ps1'
+$WindowsPowerShell = (Get-Command powershell.exe -ErrorAction Stop).Source
 $Base = Join-Path ([System.IO.Path]::GetTempPath()) ('hermes-ops-win-tests-' + [guid]::NewGuid().ToString('N'))
 
 $script:Pass = 0
@@ -44,6 +45,11 @@ function Assert-NotContains([string]$Name, [string]$Needle, [string]$Text) {
     if ($Text -like "*$Needle*") { Add-Fail $Name "unexpected '$Needle'" } else { Add-Pass $Name }
 }
 
+function Assert-MatchCount([string]$Name, [string]$Pattern, [int]$Expected, [string]$Text) {
+    $actual = [regex]::Matches($Text, $Pattern).Count
+    if ($Expected -eq $actual) { Add-Pass $Name } else { Add-Fail $Name "expected $Expected matches, got $actual" }
+}
+
 function Test-Parser {
     $tokens = $null
     $errors = $null
@@ -62,12 +68,14 @@ function New-Sandbox {
     $repo = Join-Path $dir 'repo'
     $scriptDir = Join-Path $repo 'skills\hermes-windows\scripts'
     $bin = Join-Path $dir 'bin'
-    $home = Join-Path $dir 'home'
+    $userHome = Join-Path $dir 'home'
     $localAppData = Join-Path $dir 'localappdata'
-    $receipts = Join-Path $home '.hermes\logs\update_receipts'
+    $state = Join-Path $dir 'state'
+    $receipts = Join-Path $userHome '.hermes\logs\update_receipts'
     New-Item -ItemType Directory -Path $scriptDir -Force | Out-Null
     New-Item -ItemType Directory -Path $bin -Force | Out-Null
     New-Item -ItemType Directory -Path $receipts -Force | Out-Null
+    New-Item -ItemType Directory -Path $state -Force | Out-Null
     New-Item -ItemType Directory -Path $localAppData -Force | Out-Null
     Copy-Item -LiteralPath $ScriptPath -Destination (Join-Path $scriptDir 'hermes.ps1') -Force
     $callLog = Join-Path $dir 'calls.log'
@@ -97,46 +105,222 @@ exit /b 0
         Repo = $repo
         Script = (Join-Path $scriptDir 'hermes.ps1')
         Bin = $bin
-        Home = $home
+        Home = $userHome
         LocalAppData = $localAppData
         Receipts = $receipts
+        State = $state
         CallLog = $callLog
     }
 }
 
 function Add-SourceInstall {
     param($Sandbox)
-    New-Item -ItemType Directory -Path (Join-Path $Sandbox.LocalAppData 'hermes\hermes-agent\.git') -Force | Out-Null
+    $checkout = Join-Path $Sandbox.LocalAppData 'hermes\hermes-agent'
+    New-Item -ItemType Directory -Path (Join-Path $checkout '.git') -Force | Out-Null
     New-Item -ItemType Directory -Path (Join-Path $Sandbox.LocalAppData 'hermes\bin') -Force | Out-Null
+    $oldSha = '1111111111111111111111111111111111111111'
+    $targetSha = '2222222222222222222222222222222222222222'
+    Set-Content -LiteralPath (Join-Path $Sandbox.State 'version.txt') -Value '0.23.2' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Sandbox.State 'http_version.txt') -Value '0.23.2' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Sandbox.State 'http_overall.txt') -Value 'ok' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Sandbox.State 'head.txt') -Value $oldSha -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Sandbox.State 'target_version.txt') -Value '0.23.3' -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Sandbox.State 'target_short.txt') -Value $targetSha.Substring(0, 12) -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Sandbox.State 'target_full.txt') -Value $targetSha -Encoding ASCII
+    Set-Content -LiteralPath (Join-Path $Sandbox.State 'install_id.txt') -Value 'test-install-id-0001' -Encoding ASCII
+    $unpackedDir = Join-Path $checkout 'apps\desktop\release\win-unpacked'
+    $stampDir = Join-Path $unpackedDir 'resources'
+    New-Item -ItemType Directory -Path $stampDir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $unpackedDir 'Hermes.exe') -Value 'fake' -Encoding ASCII
+    @{ commit = $oldSha; baseVersion = '0.23.2'; displayVersion = '0.23.2'; source = 'git' } |
+        ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $stampDir 'install-stamp.json') -Encoding UTF8
+
     $hermesCmd = @'
 @echo off
 echo hermes %*>>"%MOCK_CALL_LOG%"
-if "%~1"=="--version" (
-  echo Hermes Agent v0.23.2 ^(2026.9.24^) . %MOCK_SOURCE_CHANNEL% . local abc123
-  echo Install directory: %MOCK_INSTALL_DIR%
-  echo Install method: %MOCK_SOURCE_METHOD%
-  exit /b 0
-)
-if "%~1"=="update" (
-  if "%~2"=="--check" (
-    echo Update channel: %MOCK_UPDATE_CHANNEL%
-    echo Selected release available: stable v0.23.3 ^(caafe5389ae5^)
-    exit /b 0
-  )
-  if "%~2"=="--plan" (
-    echo Update plan:
-    echo   Install: git ^(v0.23.2 @ abc123^)
-    echo   Profiles: default
-    exit /b 0
-  )
-  if "%~2"=="--set-channel" (
-    echo Simulated source update.
-    exit /b 0
-  )
-)
-exit /b 0
+"%MOCK_WINDOWS_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%MOCK_HERMES_MOCK%" %*
+exit /b %ERRORLEVEL%
 '@
     Set-Content -LiteralPath (Join-Path $Sandbox.LocalAppData 'hermes\bin\hermes.cmd') -Value $hermesCmd -Encoding ASCII
+    $mock = @'
+param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
+$ErrorActionPreference = 'Continue'
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+$state = $env:MOCK_SOURCE_STATE
+$dotChar = [char]0x00B7
+$arrowChar = [char]0x2192
+function Read-State([string]$Name, [string]$Default = '') {
+    $path = Join-Path $state $Name
+    if (Test-Path -LiteralPath $path) { return (Get-Content -LiteralPath $path -Raw).Trim() }
+    return $Default
+}
+function Write-State([string]$Name, [string]$Value) {
+    Set-Content -LiteralPath (Join-Path $state $Name) -Value $Value -Encoding ASCII
+}
+function Set-DesktopStamp([string]$Version, [string]$Sha) {
+    $unpacked = Join-Path $state 'desktop\win-unpacked'
+    $dir = Join-Path $unpacked 'resources'
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $unpacked 'Hermes.exe') -Value 'fake' -Encoding ASCII
+    @{ commit = $Sha; baseVersion = $Version; displayVersion = $Version; source = 'git' } |
+        ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $dir 'install-stamp.json') -Encoding UTF8
+}
+function Copy-DesktopStamp {
+    $source = Join-Path $state 'desktop\win-unpacked'
+    $checkout = Read-State 'checkout.txt' $env:MOCK_INSTALL_DIR
+    $destination = Join-Path $checkout 'apps\desktop\release\win-unpacked'
+    if (Test-Path -LiteralPath $source) {
+        New-Item -ItemType Directory -Path $destination -Force | Out-Null
+        Copy-Item -Path (Join-Path $source '*') -Destination $destination -Recurse -Force
+    }
+}
+$version = Read-State 'version.txt' '0.23.2'
+$head = Read-State 'head.txt' '1111111111111111111111111111111111111111'
+$targetVersion = Read-State 'target_version.txt' '0.23.3'
+$targetShort = Read-State 'target_short.txt' '222222222222'
+$targetFull = Read-State 'target_full.txt' '2222222222222222222222222222222222222222'
+$installDir = $env:MOCK_INSTALL_DIR
+if (Test-Path -LiteralPath (Join-Path $state 'install_dir_after.txt')) { $installDir = Read-State 'install_dir_after.txt' }
+$channel = $env:MOCK_SOURCE_CHANNEL
+if (Test-Path -LiteralPath (Join-Path $state 'channel_after.txt')) { $channel = Read-State 'channel_after.txt' }
+$method = $env:MOCK_SOURCE_METHOD
+if ($Args.Count -eq 0) { exit 9 }
+if ($Args[0] -eq '--version') {
+    $cid = if ($env:HERMES_UPDATE_CORRELATION_ID) { $env:HERMES_UPDATE_CORRELATION_ID } else { '<unset>' }
+    Set-Content -LiteralPath (Join-Path $state 'observed_correlation.txt') -Value $cid -Encoding ASCII
+    Write-Output ("Hermes Agent v$version (2026.9.24) $dotChar $channel $dotChar local $($head.Substring(0, 12))")
+    Write-Output "Install directory: $installDir"
+    Write-Output "Install method: $method"
+    exit 0
+}
+if ($Args[0] -eq 'desktop') {
+    if (($Args -contains '--build-only') -and ($Args -contains '--force-build')) {
+        if ($env:MOCK_DESKTOP_REPAIR_FAIL -eq '1') { Write-Output 'simulated Desktop repair failure'; exit 1 }
+        Set-DesktopStamp $targetVersion $targetFull
+        Copy-DesktopStamp
+        Write-Output 'Desktop build complete.'
+        exit 0
+    }
+    exit 9
+}
+if ($Args[0] -ne 'update') { exit 9 }
+if ($Args -contains '--install-id') { Write-Output (Read-State 'install_id.txt'); exit 0 }
+if ($Args -contains '--check') {
+    Write-Output "$arrowChar Update channel: $($env:MOCK_UPDATE_CHANNEL)"
+    if (($env:MOCK_UPDATE_CURRENT -eq '1') -or (($version -eq $targetVersion) -and ($head -eq $targetFull))) {
+        Write-Output "$arrowChar Already up to date: stable v$targetVersion"
+    } else {
+        Write-Output "$arrowChar Selected release available: stable v$targetVersion ($targetShort)"
+    }
+    exit 0
+}
+if ($Args -contains '--plan') {
+    Write-Output 'Update plan:'
+    Write-Output "  Install: git (v$version @ $($head.Substring(0, 12)))"
+    Write-Output '  Profiles: default'
+    exit 0
+}
+if (-not ($Args -contains '--yes')) { Write-Output 'channel-only operation does not update'; exit 0 }
+Remove-Item -LiteralPath (Join-Path $state 'observed_correlation.txt') -ErrorAction SilentlyContinue
+$mode = if ($env:MOCK_UPDATE_MODE) { $env:MOCK_UPDATE_MODE } else { 'success' }
+$oldVersion = $version
+$oldHead = $head
+$correlation = if ($env:HERMES_UPDATE_CORRELATION_ID) { $env:HERMES_UPDATE_CORRELATION_ID } else { '' }
+$updateId = [guid]::NewGuid().ToString('N')
+$outcome = 'success'
+$exitCode = 0
+$followups = @()
+$gatewayIncomplete = $false
+$buildOutcome = 'success'
+if ($mode -eq 'fail' -or $mode -eq 'fail_with_desktop_owed') {
+    $outcome = 'failed'
+    $exitCode = 1
+    if ($mode -eq 'fail_with_desktop_owed') { Write-Output '⚠ Desktop app build owed: build failed' }
+}
+elseif ($mode -ne 'no_install') {
+    $version = $targetVersion
+    $head = $targetFull
+    if ($mode -eq 'wrong_revision') { $head = '3333333333333333333333333333333333333333' }
+    if ($mode -eq 'wrong_version') { $version = '0.23.2' }
+    Write-State 'version.txt' $version
+    Write-State 'head.txt' $head
+    Write-State 'updated.txt' '1'
+    Set-Content -LiteralPath (Join-Path $state 'http_version.txt') -Value $version -Encoding ASCII
+    if ($mode -ne 'desktop_failed') { Set-DesktopStamp $version $head; Copy-DesktopStamp }
+    if ($mode -eq 'target_drift') {
+        Write-State 'target_version.txt' '0.23.4'
+        Write-State 'target_short.txt' '444444444444'
+        Write-State 'target_full.txt' '4444444444444444444444444444444444444444'
+    }
+    if ($mode -eq 'identity_change') { Write-State 'install_id.txt' 'changed-install-id' }
+    if ($mode -eq 'checkout_change') { Write-State 'install_dir_after.txt' (Join-Path $env:MOCK_SOURCE_STATE 'other-checkout') }
+    if ($mode -eq 'channel_change') { Write-State 'channel_after.txt' 'canary' }
+    if ($mode -eq 'dirty_after') { Write-State 'dirty_after.txt' 'M tracked.txt' }
+    if ($mode -eq 'desktop_failed') {
+        $buildOutcome = 'failed'
+        $followups = @(@{ step = 'build'; reason = 'Desktop app build failed' })
+        Write-Output '⚠ Desktop app build owed: build failed'
+    }
+}
+$receiptMode = $mode
+if ($receiptMode -eq 'receipt_missing' -or $receiptMode -eq 'receipt_historical' -or $receiptMode -eq 'no_install') {
+    Write-Output 'simulated update without a current receipt'
+    exit $exitCode
+}
+$receiptCorrelation = $correlation
+if ($receiptMode -eq 'receipt_mismatch') { $receiptCorrelation = 'wrong-correlation' }
+if ($receiptMode -eq 'receipt_no_correlation') { $receiptCorrelation = '' }
+if ($receiptMode -eq 'receipt_failed' -or $receiptMode -eq 'receipt_failed_unrelated_success') { $outcome = 'failed'; $exitCode = 1 }
+if ($receiptMode -eq 'receipt_followup') { $followups = @(@{ step = 'gateway_restart'; reason = 'deferred backend restart' }) }
+if ($receiptMode -eq 'receipt_gateway_incomplete') { $gatewayIncomplete = $true }
+$started = (Get-Date).ToUniversalTime().ToString('o')
+$finished = (Get-Date).ToUniversalTime().ToString('o')
+$receipt = @{
+    schema = 1
+    started_at = $started
+    finished_at = $finished
+    argv = @('hermes', 'update', '--yes')
+    pid = $PID
+    exit_code = $exitCode
+    outcome = $outcome
+    pre_update = @{ sha = $oldHead; short_sha = $oldHead.Substring(0, 8); version = $oldVersion; source = 'git' }
+    post_update = @{ sha = $head; short_sha = $head.Substring(0, 8); version = $version; source = 'git' }
+    steps = @()
+    followups = $followups
+    gateway_restart = @{ incomplete = $gatewayIncomplete; failed_units = @() }
+    stages = @(@{ name = 'build'; outcome = $buildOutcome })
+    update_id = $updateId
+    correlation_id = $receiptCorrelation
+}
+if ($receiptMode -eq 'receipt_incomplete') {
+    $receipt.Remove('finished_at')
+    $receipt.Remove('post_update')
+}
+$receiptDir = Join-Path $env:HERMES_HOME 'logs\update_receipts'
+New-Item -ItemType Directory -Path $receiptDir -Force | Out-Null
+if ($receiptMode -eq 'receipt_malformed') {
+    Set-Content -LiteralPath (Join-Path $receiptDir 'update_malformed.json') -Value '{"schema":1,' -Encoding UTF8
+} else {
+    $path = Join-Path $receiptDir ("update_$((Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmssfff'))_${PID}_$updateId.json")
+    $receipt | ConvertTo-Json -Depth 12 -Compress | Set-Content -LiteralPath $path -Encoding UTF8
+    if ($receiptMode -eq 'receipt_plugin') {
+        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+        @{ schema = 1; kind = 'plugin-check'; outcome = 'updates-available'; update_id = $null; correlation_id = $null } |
+            ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $receiptDir 'latest.json') -Encoding UTF8
+    } elseif ($receiptMode -eq 'receipt_unrelated_latest') {
+        @{ schema = 1; outcome = 'failed'; followups = @(); gateway_restart = @{ incomplete = $false }; correlation_id = 'unrelated'; update_id = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'; finished_at = $finished } |
+            ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $receiptDir 'latest.json') -Encoding UTF8
+    } elseif ($receiptMode -eq 'receipt_failed_unrelated_success') {
+        @{ schema = 1; outcome = 'success'; followups = @(); gateway_restart = @{ incomplete = $false }; correlation_id = 'unrelated-success'; update_id = 'eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee'; finished_at = $finished } |
+            ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $receiptDir 'latest.json') -Encoding UTF8
+    } else {
+        $receipt | ConvertTo-Json -Depth 12 -Compress | Set-Content -LiteralPath (Join-Path $receiptDir 'latest.json') -Encoding UTF8
+    }
+}
+Write-Output 'simulated source update'
+exit $exitCode
+'@
+    Set-Content -LiteralPath (Join-Path $Sandbox.Bin 'hermes_mock.ps1') -Value $mock -Encoding UTF8
     Add-GitShim $Sandbox
 }
 
@@ -145,49 +329,123 @@ function Add-GitShim {
     $gitCmd = @'
 @echo off
 echo git %*>>"%MOCK_CALL_LOG%"
-if "%~1"=="-C" (
-  if "%~3"=="remote" (
-    echo %MOCK_GIT_REMOTE%
-    exit /b 0
-  )
-  if "%~3"=="rev-parse" (
-    if "%~4"=="--is-inside-work-tree" (
-      echo %MOCK_GIT_INSIDE%
-      exit /b 0
-    )
-    if "%~4"=="--short=12" (
-      echo abc123def456
-      exit /b 0
-    )
-  )
-  if "%~3"=="symbolic-ref" (
-    if "%MOCK_GIT_BRANCH%"=="DETACHED" ( exit /b 1 )
-    echo %MOCK_GIT_BRANCH%
-    exit /b 0
-  )
-  if "%~3"=="status" (
-    if not "%MOCK_GIT_STATUS_EXIT%"=="0" (
-      echo fatal: unable to read repository 1>&2
-      exit /b %MOCK_GIT_STATUS_EXIT%
-    )
-    if not "%MOCK_GIT_STATUS%"=="" echo %MOCK_GIT_STATUS%
-    exit /b 0
-  )
-)
-exit /b 1
+"%MOCK_WINDOWS_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%MOCK_GIT_MOCK%" %*
+exit /b %ERRORLEVEL%
 '@
     Set-Content -LiteralPath (Join-Path $Sandbox.Bin 'git.cmd') -Value $gitCmd -Encoding ASCII
+    $mock = @'
+param([Parameter(ValueFromRemainingArguments=$true)][string[]]$Args)
+$ErrorActionPreference = 'Continue'
+$state = $env:MOCK_SOURCE_STATE
+function Read-State([string]$Name, [string]$Default = '') {
+    $path = Join-Path $state $Name
+    if (Test-Path -LiteralPath $path) { return (Get-Content -LiteralPath $path -Raw).Trim() }
+    return $Default
+}
+if ($Args.Count -lt 3 -or $Args[0] -ne '-C') { exit 1 }
+$command = $Args[2]
+if ($command -eq 'remote') {
+    $remote = $env:MOCK_GIT_REMOTE
+    if ((Test-Path -LiteralPath (Join-Path $state 'updated.txt')) -and (Test-Path -LiteralPath (Join-Path $state 'remote_after.txt'))) {
+        $remote = Read-State 'remote_after.txt'
+    }
+    Write-Output $remote
+    exit 0
+}
+if ($command -eq 'ls-remote') {
+    if ($env:MOCK_TARGET_UNRESOLVED -eq '1') { [Console]::Error.WriteLine('remote target unavailable'); exit 128 }
+    $targetVersion = Read-State 'target_version.txt'
+    $full = Read-State 'target_full.txt'
+    Write-Output ($full + "`trefs/tags/v$targetVersion^{}")
+    exit 0
+}
+if ($command -eq 'rev-parse') {
+    $argument = $Args[3]
+    if ($argument -eq '--is-inside-work-tree') { Write-Output $env:MOCK_GIT_INSIDE; exit 0 }
+    if ($argument -eq 'HEAD') { Write-Output (Read-State 'head.txt'); exit 0 }
+    if (($argument -eq '--verify') -and ($Args.Count -ge 5)) { $argument = $Args[4] }
+    if (($argument -like '*^{commit}') -or ($argument -like '*{commit}')) {
+        if (($env:MOCK_TARGET_UNRESOLVED -eq '1') -or ($env:MOCK_LOCAL_TARGET_MISSING -eq '1')) { [Console]::Error.WriteLine('Needed a single revision'); exit 128 }
+        Write-Output (Read-State 'target_full.txt')
+        exit 0
+    }
+    exit 1
+}
+if ($command -eq 'symbolic-ref') {
+    if ($env:MOCK_GIT_BRANCH -eq 'DETACHED') { exit 1 }
+    Write-Output $env:MOCK_GIT_BRANCH
+    exit 0
+}
+if ($command -eq 'status') {
+    if ($env:MOCK_GIT_STATUS_EXIT -ne '0') { [Console]::Error.WriteLine('fatal: unable to read repository'); exit [int]$env:MOCK_GIT_STATUS_EXIT }
+    $status = $env:MOCK_GIT_STATUS
+    if ((Test-Path -LiteralPath (Join-Path $state 'updated.txt')) -and (Test-Path -LiteralPath (Join-Path $state 'dirty_after.txt'))) { $status = Read-State 'dirty_after.txt' }
+    if ($status) { Write-Output $status }
+    exit 0
+}
+exit 1
+'@
+    Set-Content -LiteralPath (Join-Path $Sandbox.Bin 'git_mock.ps1') -Value $mock -Encoding UTF8
+}
+
+function Enable-UnicodeMock {
+    param($Sandbox)
+    $asciiPath = Join-Path $Sandbox.LocalAppData 'hermes\bin\hermes_ascii.cmd'
+    Copy-Item -LiteralPath (Join-Path $Sandbox.LocalAppData 'hermes\bin\hermes.cmd') -Destination $asciiPath -Force
+    $emitter = Join-Path $Sandbox.Bin 'unicode_output.ps1'
+    @'
+param([string]$Kind, [string]$Channel, [string]$InstallDir, [string]$Method)
+[Console]::OutputEncoding = New-Object System.Text.UTF8Encoding($false)
+if ($Kind -eq 'version') {
+    Write-Output ("Hermes Agent v0.23.2 (2026.9.24) · " + $Channel + " · local abc123")
+    Write-Output "Install directory: $InstallDir"
+    Write-Output "Install method: $Method"
+} else {
+    Write-Output "→ Update channel: $Channel"
+    Write-Output "→ Selected release available: stable v0.23.3 (caafe5389ae5)"
+}
+'@ | Set-Content -LiteralPath $emitter -Encoding UTF8
+    $launcher = @'
+@echo off
+echo hermes %*>>"%MOCK_CALL_LOG%"
+if "%~1"=="--version" (
+  "%MOCK_WINDOWS_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%MOCK_UNICODE_SCRIPT%" version "%MOCK_SOURCE_CHANNEL%" "%MOCK_INSTALL_DIR%" "%MOCK_SOURCE_METHOD%"
+  exit /b %ERRORLEVEL%
+)
+if "%~1"=="update" if "%~2"=="--check" (
+  "%MOCK_WINDOWS_POWERSHELL%" -NoProfile -ExecutionPolicy Bypass -File "%MOCK_UNICODE_SCRIPT%" check "%MOCK_UPDATE_CHANNEL%" "%MOCK_INSTALL_DIR%" "%MOCK_SOURCE_METHOD%"
+  exit /b %ERRORLEVEL%
+)
+call "%MOCK_HERMES_ASCII%" %*
+exit /b %ERRORLEVEL%
+'@
+    Set-Content -LiteralPath (Join-Path $Sandbox.LocalAppData 'hermes\bin\hermes.cmd') -Value $launcher -Encoding ASCII
 }
 
 function Set-Receipt {
     param($Sandbox, [int]$Followups)
+    $followupList = @()
+    $gatewayIncomplete = $false
     if ($Followups -gt 0) {
-        $json = '{"schema":1,"outcome":"success","followups":[{"step":"gateway_restart","reason":"deferred backend restart"}],"gateway_restart":{"incomplete":true}}'
-    } else {
-        $json = '{"schema":1,"outcome":"success","followups":[],"gateway_restart":{"incomplete":false},"desktop":{"status":"ok"}}'
+        $followupList = @(@{ step = 'gateway_restart'; reason = 'deferred backend restart' })
+        $gatewayIncomplete = $true
+    }
+    $receipt = @{
+        schema = 1
+        started_at = (Get-Date).ToUniversalTime().AddMinutes(-2).ToString('o')
+        finished_at = (Get-Date).ToUniversalTime().AddMinutes(-1).ToString('o')
+        argv = @('hermes', 'update', '--yes')
+        outcome = 'success'
+        pre_update = @{ sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; version = '0.23.1'; source = 'git' }
+        post_update = @{ sha = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; version = '0.23.2'; source = 'git' }
+        followups = $followupList
+        gateway_restart = @{ incomplete = $gatewayIncomplete }
+        stages = @(@{ name = 'build'; outcome = 'success' })
+        update_id = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+        correlation_id = 'historical-check-receipt'
     }
     $path = Join-Path $Sandbox.Receipts ('update_' + (Get-Date).ToUniversalTime().ToString('yyyyMMddHHmmssfff') + '.json')
-    Set-Content -LiteralPath $path -Value $json -Encoding UTF8
+    $receipt | ConvertTo-Json -Depth 10 -Compress | Set-Content -LiteralPath $path -Encoding UTF8
 }
 
 function Get-Preamble {
@@ -196,6 +454,18 @@ function Get-CimInstance {
     [CmdletBinding()]
     param([string]$ClassName, [string]$Filter)
     [pscustomobject]@{ Caption = 'Microsoft Windows 11 Pro'; BuildNumber = '22631' }
+}
+function Get-PSDrive {
+    [CmdletBinding()]
+    param([string]$Name)
+    [pscustomobject]@{ Name = $Name; Free = 10GB; Used = 1GB }
+}
+function Get-Process {
+    [CmdletBinding()]
+    param([string]$Name)
+    if ($env:MOCK_DESKTOP_LOCKED -eq '1') {
+        [pscustomobject]@{ Id = 4242; ProcessName = 'Hermes'; Path = (Join-Path $env:MOCK_DESKTOP_RELEASE_DIR 'win-unpacked\Hermes.exe') }
+    }
 }
 function Get-MockHermesPackage {
     param([string]$Name, [string]$Version, [string]$Publisher, [string]$SignatureKind)
@@ -206,8 +476,8 @@ function Get-MockHermesPackage {
         Version = $versionValue
         Publisher = $Publisher
         SignatureKind = $SignatureKind
-        PackageFullName = "$Name`_$Version`_neutral__test"
-        PackageFamilyName = "$Name`_test"
+        PackageFullName = ($Name + '_' + $Version + '_neutral__test')
+        PackageFamilyName = ($Name + '_test')
         InstallLocation = 'C:\Program Files\WindowsApps\fake'
     }
 }
@@ -272,6 +542,14 @@ function Invoke-Sandbox {
         [string]$SourceChannel = 'stable',
         [string]$SourceMethod = 'git',
         [string]$UpdateChannel = 'stable',
+        [string]$UpdateCurrent = '0',
+        [string]$BackendEnvironmentUrl = '',
+        [string]$UpdateMode = 'success',
+        [string]$TargetUnresolved = '0',
+        [string]$LocalTargetMissing = '0',
+        [string]$DesktopRepairFail = '0',
+        [string]$DesktopLocked = '0',
+        [string]$ExistingCorrelation = '',
         [string]$AppxFailMode = '',
         [string]$AppxDisappear = '0',
         [string]$AppxOwnerChange = '0',
@@ -286,7 +564,9 @@ function Invoke-Sandbox {
         else { $quotedArgs += ("'" + ($a -replace "'", "''") + "'") }
     }
     $argText = ($quotedArgs -join ' ')
-    $cmd = (Get-Preamble) + "`n& '$($Sandbox.Script)' $argText; exit `$LASTEXITCODE"
+    $runner = Join-Path $Sandbox.Dir 'invoke.ps1'
+    $runnerBody = (Get-Preamble) + "`n& '$($Sandbox.Script)' $argText" + "`nexit `$LASTEXITCODE`n"
+    Set-Content -LiteralPath $runner -Value $runnerBody -Encoding UTF8
 
     $oldPath = $env:PATH
     $oldHome = $env:USERPROFILE
@@ -296,8 +576,23 @@ function Invoke-Sandbox {
     $oldWinget = $env:MOCK_WINGET_NO_UPGRADE
     $oldLog = $env:MOCK_CALL_LOG
     $oldScript = $env:MOCK_SCRIPT_PATH
+    $oldWindowsPowerShell = $env:MOCK_WINDOWS_POWERSHELL
+    $oldUnicodeScript = $env:MOCK_UNICODE_SCRIPT
+    $oldHermesAscii = $env:MOCK_HERMES_ASCII
+    $oldSourceState = $env:MOCK_SOURCE_STATE
+    $oldHermesMock = $env:MOCK_HERMES_MOCK
+    $oldGitMock = $env:MOCK_GIT_MOCK
+    $oldUpdateMode = $env:MOCK_UPDATE_MODE
+    $oldTargetUnresolved = $env:MOCK_TARGET_UNRESOLVED
+    $oldLocalTargetMissing = $env:MOCK_LOCAL_TARGET_MISSING
+    $oldDesktopRepairFail = $env:MOCK_DESKTOP_REPAIR_FAIL
+    $oldDesktopLocked = $env:MOCK_DESKTOP_LOCKED
+    $oldDesktopReleaseDir = $env:MOCK_DESKTOP_RELEASE_DIR
+    $oldCorrelation = $env:HERMES_UPDATE_CORRELATION_ID
+    $oldModuleCache = $env:PSModuleAnalysisCachePath
     $oldRemoteUrl = $env:HERMES_DESKTOP_REMOTE_URL
     $oldAppInstaller = $env:HERMES_APPINSTALLER_FILE
+    $oldErrorActionPreference = $ErrorActionPreference
     $oldGitRemote = $env:MOCK_GIT_REMOTE
     $oldGitBranch = $env:MOCK_GIT_BRANCH
     $oldGitStatus = $env:MOCK_GIT_STATUS
@@ -307,6 +602,7 @@ function Invoke-Sandbox {
     $oldSourceChannel = $env:MOCK_SOURCE_CHANNEL
     $oldSourceMethod = $env:MOCK_SOURCE_METHOD
     $oldUpdateChannel = $env:MOCK_UPDATE_CHANNEL
+    $oldUpdateCurrent = $env:MOCK_UPDATE_CURRENT
     $oldAppxFailMode = $env:MOCK_APPX_FAIL_MODE
     $oldAppxDisappear = $env:MOCK_APPX_DISAPPEAR
     $oldAppxOwnerChange = $env:MOCK_APPX_OWNER_CHANGE
@@ -317,12 +613,26 @@ function Invoke-Sandbox {
         $env:USERPROFILE = $Sandbox.Home
         $env:LOCALAPPDATA = $Sandbox.LocalAppData
         $env:HERMES_HOME = (Join-Path $Sandbox.Home '.hermes')
-        $env:HERMES_DESKTOP_REMOTE_URL = ''
+        $env:HERMES_DESKTOP_REMOTE_URL = $BackendEnvironmentUrl
         $env:HERMES_APPINSTALLER_FILE = ''
         $env:MOCK_APPX_MODE = $AppxMode
         $env:MOCK_WINGET_NO_UPGRADE = $WingetNoUpgrade
         $env:MOCK_CALL_LOG = $Sandbox.CallLog
         $env:MOCK_SCRIPT_PATH = $Sandbox.Script
+        $env:MOCK_WINDOWS_POWERSHELL = $WindowsPowerShell
+        $env:MOCK_UNICODE_SCRIPT = Join-Path $Sandbox.Bin 'unicode_output.ps1'
+        $env:MOCK_HERMES_ASCII = Join-Path $Sandbox.LocalAppData 'hermes\bin\hermes_ascii.cmd'
+        $env:MOCK_SOURCE_STATE = $Sandbox.State
+        $env:MOCK_HERMES_MOCK = Join-Path $Sandbox.Bin 'hermes_mock.ps1'
+        $env:MOCK_GIT_MOCK = Join-Path $Sandbox.Bin 'git_mock.ps1'
+        $env:MOCK_UPDATE_MODE = $UpdateMode
+        $env:MOCK_TARGET_UNRESOLVED = $TargetUnresolved
+        $env:MOCK_LOCAL_TARGET_MISSING = $LocalTargetMissing
+        $env:MOCK_DESKTOP_REPAIR_FAIL = $DesktopRepairFail
+        $env:MOCK_DESKTOP_LOCKED = $DesktopLocked
+        $env:MOCK_DESKTOP_RELEASE_DIR = Join-Path $InstallDir 'apps\desktop\release'
+        $env:HERMES_UPDATE_CORRELATION_ID = $ExistingCorrelation
+        $env:PSModuleAnalysisCachePath = Join-Path $Base 'ModuleAnalysisCache'
         $env:MOCK_GIT_REMOTE = $GitRemote
         $env:MOCK_GIT_BRANCH = $GitBranch
         $env:MOCK_GIT_STATUS = $GitStatus
@@ -332,14 +642,17 @@ function Invoke-Sandbox {
         $env:MOCK_SOURCE_CHANNEL = $SourceChannel
         $env:MOCK_SOURCE_METHOD = $SourceMethod
         $env:MOCK_UPDATE_CHANNEL = $UpdateChannel
+        $env:MOCK_UPDATE_CURRENT = $UpdateCurrent
         $env:MOCK_APPX_FAIL_MODE = $AppxFailMode
         $env:MOCK_APPX_DISAPPEAR = $AppxDisappear
         $env:MOCK_APPX_OWNER_CHANGE = $AppxOwnerChange
         $env:MOCK_APPX_UPDATED_VERSION = $AppxUpdatedVersion
         $env:MOCK_APPX_UPDATED = ''
-        $output = & powershell.exe -NoProfile -ExecutionPolicy Bypass -Command $cmd 2>&1 | Out-String
+        $ErrorActionPreference = 'Continue'
+        $output = & $WindowsPowerShell -NoProfile -ExecutionPolicy Bypass -File $runner 2>&1 | Out-String
         $code = $LASTEXITCODE
     } finally {
+        $ErrorActionPreference = $oldErrorActionPreference
         $env:PATH = $oldPath
         $env:USERPROFILE = $oldHome
         $env:LOCALAPPDATA = $oldLocal
@@ -348,6 +661,20 @@ function Invoke-Sandbox {
         $env:MOCK_WINGET_NO_UPGRADE = $oldWinget
         $env:MOCK_CALL_LOG = $oldLog
         $env:MOCK_SCRIPT_PATH = $oldScript
+        $env:MOCK_WINDOWS_POWERSHELL = $oldWindowsPowerShell
+        $env:MOCK_UNICODE_SCRIPT = $oldUnicodeScript
+        $env:MOCK_HERMES_ASCII = $oldHermesAscii
+        $env:MOCK_SOURCE_STATE = $oldSourceState
+        $env:MOCK_HERMES_MOCK = $oldHermesMock
+        $env:MOCK_GIT_MOCK = $oldGitMock
+        $env:MOCK_UPDATE_MODE = $oldUpdateMode
+        $env:MOCK_TARGET_UNRESOLVED = $oldTargetUnresolved
+        $env:MOCK_LOCAL_TARGET_MISSING = $oldLocalTargetMissing
+        $env:MOCK_DESKTOP_REPAIR_FAIL = $oldDesktopRepairFail
+        $env:MOCK_DESKTOP_LOCKED = $oldDesktopLocked
+        $env:MOCK_DESKTOP_RELEASE_DIR = $oldDesktopReleaseDir
+        $env:HERMES_UPDATE_CORRELATION_ID = $oldCorrelation
+        $env:PSModuleAnalysisCachePath = $oldModuleCache
         $env:HERMES_DESKTOP_REMOTE_URL = $oldRemoteUrl
         $env:HERMES_APPINSTALLER_FILE = $oldAppInstaller
         $env:MOCK_GIT_REMOTE = $oldGitRemote
@@ -359,6 +686,7 @@ function Invoke-Sandbox {
         $env:MOCK_SOURCE_CHANNEL = $oldSourceChannel
         $env:MOCK_SOURCE_METHOD = $oldSourceMethod
         $env:MOCK_UPDATE_CHANNEL = $oldUpdateChannel
+        $env:MOCK_UPDATE_CURRENT = $oldUpdateCurrent
         $env:MOCK_APPX_FAIL_MODE = $oldAppxFailMode
         $env:MOCK_APPX_DISAPPEAR = $oldAppxDisappear
         $env:MOCK_APPX_OWNER_CHANGE = $oldAppxOwnerChange
@@ -411,6 +739,121 @@ $body</AppInstaller>
     return $path
 }
 
+function Start-MockBackend {
+    param($Sandbox)
+    $probe = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, 0)
+    $probe.Start()
+    $port = $probe.LocalEndpoint.Port
+    $probe.Stop()
+    $ready = Join-Path $Sandbox.State 'backend-ready.txt'
+    $stop = Join-Path $Sandbox.State 'backend-stop.txt'
+    Remove-Item -LiteralPath $stop -Force -ErrorAction SilentlyContinue
+    $versionFile = Join-Path $Sandbox.State 'http_version.txt'
+    $overallFile = Join-Path $Sandbox.State 'http_overall.txt'
+    $job = Start-Job -ScriptBlock {
+        param([int]$Port, [string]$Ready, [string]$VersionFile, [string]$OverallFile, [string]$StopFile)
+        $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
+        $listener.Start()
+        Set-Content -LiteralPath $Ready -Value 'ready' -Encoding ASCII
+        $deadline = (Get-Date).AddSeconds(60)
+        while ((Get-Date) -lt $deadline -and -not (Test-Path -LiteralPath $StopFile) -and $listener.Pending() -eq $false) {
+            Start-Sleep -Milliseconds 25
+        }
+        while (-not (Test-Path -LiteralPath $StopFile) -and (Get-Date) -lt $deadline) {
+            if (-not $listener.Pending()) { Start-Sleep -Milliseconds 25; continue }
+            $client = $null
+            try {
+                $client = $listener.AcceptTcpClient()
+                $stream = $client.GetStream()
+                $stream.ReadTimeout = 2000
+                $buffer = New-Object byte[] 4096
+                $read = $stream.Read($buffer, 0, $buffer.Length)
+                if ($read -eq 0) { $client.Close(); continue }
+                $version = (Get-Content -LiteralPath $VersionFile -Raw).Trim()
+                $overall = (Get-Content -LiteralPath $OverallFile -Raw).Trim()
+                $body = '{"version":"' + $version + '","auth_required":true,"auth_providers":["basic"],"gateway_running":true,"overall":"' + $overall + '","profiles":["default"]}'
+                $bytes = [Text.Encoding]::UTF8.GetBytes($body)
+                $header = "HTTP/1.1 200 OK`r`nContent-Type: application/json`r`nContent-Length: $($bytes.Length)`r`nConnection: close`r`n`r`n"
+                $headerBytes = [Text.Encoding]::ASCII.GetBytes($header)
+                $stream.Write($headerBytes, 0, $headerBytes.Length)
+                $stream.Write($bytes, 0, $bytes.Length)
+                $stream.Flush()
+                $client.Close()
+            } catch {
+                try { if ($null -ne $client) { $client.Close() } } catch { }
+            }
+        }
+        $listener.Stop()
+    } -ArgumentList $port, $ready, $versionFile, $overallFile, $stop
+    for ($i = 0; $i -lt 100 -and -not (Test-Path -LiteralPath $ready); $i++) { Start-Sleep -Milliseconds 50 }
+    if (-not (Test-Path -LiteralPath $ready)) {
+        Stop-Job $job -ErrorAction SilentlyContinue
+        Remove-Job $job -Force -ErrorAction SilentlyContinue
+        throw 'Mock backend did not start.'
+    }
+    return [pscustomobject]@{ Url = "http://127.0.0.1:$port"; Job = $job; StopFile = $stop }
+}
+
+function Stop-MockBackend {
+    param($Backend)
+    if ($null -ne $Backend) {
+        Set-Content -LiteralPath $Backend.StopFile -Value 'stop' -Encoding ASCII
+        Wait-Job -Job $Backend.Job -Timeout 3 -ErrorAction SilentlyContinue | Out-Null
+        Remove-Job -Job $Backend.Job -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function New-HistoricalReceipt {
+    param($Sandbox, [string]$Correlation = 'historical-correlation', [string]$BuildOutcome = 'failed')
+    $receipt = @{
+        schema = 1
+        started_at = (Get-Date).ToUniversalTime().AddDays(-1).ToString('o')
+        finished_at = (Get-Date).ToUniversalTime().AddDays(-1).AddMinutes(1).ToString('o')
+        argv = @('hermes', 'update', '--yes')
+        outcome = 'success'
+        pre_update = @{ sha = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'; version = '0.23.1'; source = 'git' }
+        post_update = @{ sha = 'bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb'; version = '0.23.2'; source = 'git' }
+        followups = @(@{ step = 'build'; reason = 'historical Desktop build failure' })
+        gateway_restart = @{ incomplete = $false }
+        stages = @(@{ name = 'build'; outcome = $BuildOutcome })
+        update_id = 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa'
+        correlation_id = $Correlation
+    }
+    $path = Join-Path $Sandbox.Receipts 'update_historical.json'
+    $receipt | ConvertTo-Json -Depth 10 -Compress | Set-Content -LiteralPath $path -Encoding UTF8
+    $receipt | ConvertTo-Json -Depth 10 -Compress | Set-Content -LiteralPath (Join-Path $Sandbox.Receipts 'latest.json') -Encoding UTF8
+}
+
+function Get-CurrentReceipt {
+    param($Sandbox)
+    $path = Get-ChildItem -LiteralPath $Sandbox.Receipts -Filter 'update_*.json' -File |
+        Where-Object { $_.Name -ne 'update_historical.json' -and $_.Name -ne 'update_malformed.json' } |
+        Sort-Object LastWriteTime -Descending | Select-Object -First 1
+    if ($null -eq $path) { return $null }
+    try { return Get-Content -LiteralPath $path.FullName -Raw | ConvertFrom-Json } catch { return $null }
+}
+
+function Invoke-SourceUpdateScenario {
+    param(
+        $Sandbox,
+        [string]$Mode = 'success',
+        [string]$TargetUnresolved = '0',
+        [string]$LocalTargetMissing = '0',
+        [string]$ExistingCorrelation = '',
+        [string]$DesktopRepairFail = '0',
+        [switch]$NoBackup,
+        [switch]$DesktopLocked
+    )
+    $backend = Start-MockBackend $Sandbox
+    try {
+        $arguments = @('update', '-BackendUrl', $backend.Url)
+        if ($NoBackup) { $arguments += '-NoBackup' }
+        return Invoke-Sandbox $Sandbox $arguments -AppxMode 'none' -UpdateMode $Mode -TargetUnresolved $TargetUnresolved -LocalTargetMissing $LocalTargetMissing -ExistingCorrelation $ExistingCorrelation -DesktopRepairFail $DesktopRepairFail -DesktopLocked $(if ($DesktopLocked) { '1' } else { '0' })
+    } finally {
+        Stop-MockBackend $backend
+    }
+}
+
 # ---------------------------------------------------------------------------
 Write-Output '== Windows hermes.ps1 tests =='
 Test-Parser
@@ -442,6 +885,42 @@ try {
     Assert-Equal 'source network exit' '1' "$($r.ExitCode)"
     Assert-Contains 'source network degraded' 'STATUS: DEGRADED' $r.Output
     Assert-Contains 'network failure classified' 'TCP connection' $r.Output
+
+    # 2c. Native UTF-8 output and UTF-8 report bytes preserve Unicode.
+    $s = New-Sandbox 'source_unicode'
+    Add-SourceInstall $s
+    Enable-UnicodeMock $s
+    $r = Invoke-Sandbox $s @('check', '-BackendUrl', 'http://127.0.0.1:1') -AppxMode 'none'
+    Assert-Contains 'native arrow decoded' '→ Update channel: stable' $r.Report
+    Assert-Contains 'native bullets decoded' '· stable · local' $r.Report
+    Assert-NotContains 'native arrow is not mojibake' 'ΓåÆ' $r.Report
+    Assert-NotContains 'native bullet is not mojibake' '┬╖' $r.Report
+    $reportUtf8 = [Text.Encoding]::UTF8.GetString([IO.File]::ReadAllBytes($r.ReportPath))
+    Assert-Contains 'report UTF-8 bytes preserve arrow' '→ Update channel: stable' $reportUtf8
+    Assert-Contains 'report UTF-8 bytes preserve bullet' '· stable · local' $reportUtf8
+    Assert-Contains 'Unicode version still parses' 'INSTALLED: v0.23.2' $r.Output
+    Assert-Contains 'Unicode channel still parses' 'channel=stable' $r.Report
+
+    # 2b. Backend URL precedence and source reporting.
+    $s = New-Sandbox 'backend_explicit'
+    Add-SourceInstall $s
+    $r = Invoke-Sandbox $s @('check', '-BackendUrl', 'http://127.0.0.1:1') -AppxMode 'none' -BackendEnvironmentUrl 'http://127.0.0.1:2'
+    Assert-Contains 'explicit backend URL source reported' 'explicit -BackendUrl' $r.Report
+    Assert-Contains 'explicit backend URL reaches TCP check' '127.0.0.1:1' $r.Report
+    Assert-NotContains 'environment backend does not override explicit URL' '127.0.0.1:2' $r.Report
+
+    $s = New-Sandbox 'backend_environment'
+    Add-SourceInstall $s
+    $r = Invoke-Sandbox $s @('check') -AppxMode 'none' -BackendEnvironmentUrl 'http://127.0.0.1:1'
+    Assert-Contains 'environment backend URL source reported' 'pre-existing HERMES_DESKTOP_REMOTE_URL' $r.Report
+    Assert-Contains 'environment backend URL reaches TCP check' '127.0.0.1:1' $r.Report
+
+    $s = New-Sandbox 'backend_invalid_explicit'
+    Add-SourceInstall $s
+    $r = Invoke-Sandbox $s @('check', '-BackendUrl', 'not-a-url') -AppxMode 'none' -BackendEnvironmentUrl 'http://127.0.0.1:1'
+    Assert-Equal 'invalid explicit backend URL blocks' '2' "$($r.ExitCode)"
+    Assert-Contains 'invalid explicit backend URL is rejected' 'not an absolute URI' $r.Output
+    Assert-NotContains 'invalid explicit URL does not use environment fallback' 'pre-existing HERMES_DESKTOP_REMOTE_URL' $r.Report
 
     # 3. Source receipt follow-up: not success.
     $s = New-Sandbox 'source_receipt'
@@ -490,8 +969,9 @@ try {
     # 9. Credential-bearing URL is rejected and never written to the report.
     $s = New-Sandbox 'credential_url'
     Add-SourceInstall $s
-    $r = Invoke-Sandbox $s @('check', '-BackendUrl', 'http://user:topsecret@127.0.0.1:9119') -AppxMode 'none'
+    $r = Invoke-Sandbox $s @('check', '-BackendUrl', 'http://user:topsecret@127.0.0.1:9119') -AppxMode 'none' -BackendEnvironmentUrl 'http://127.0.0.1:1'
     Assert-Equal 'credential URL exit' '2' "$($r.ExitCode)"
+    Assert-Contains 'credential URL source remains explicit' 'explicit -BackendUrl' $r.Report
     Assert-NotContains 'credential URL not in report' 'topsecret' $r.Report
     Assert-NotContains 'credential URL not in stdout' 'topsecret' $r.Output
 
@@ -501,6 +981,7 @@ try {
     $r = Invoke-Sandbox $s @('update') -AppxMode 'store'
     Assert-Equal 'ambiguous update exit' '2' "$($r.ExitCode)"
     Assert-NotContains 'ambiguous update did not run source updater' '--set-channel' $r.Calls
+    Assert-NotContains 'ambiguous update did not run native updater' 'hermes update --yes' $r.Calls
     Assert-NotContains 'ambiguous update did not run winget upgrade' 'winget upgrade' $r.Calls
 
     # 11. Store detection keeps the exact product ID and official identity.
@@ -656,7 +1137,215 @@ try {
     Assert-Equal 'sideload feed failure exit' '2' "$($r.ExitCode)"
     Assert-Contains 'sideload feed failure blocked' 'Official descriptor feed was unavailable' $r.Output
 
-    # 18. Source provenance failures block before any source update.
+    # 18. Source update command is the native updater, never a channel-only operation.
+    $s = New-Sandbox 'source_update_command'
+    Add-SourceInstall $s
+    $r = Invoke-Sandbox $s @('update') -AppxMode 'none'
+    Assert-NotContains 'source update never selects a channel' '--set-channel' $r.Calls
+    Assert-MatchCount 'source update invokes native updater exactly once' '(?m)^hermes update --yes\r?$' 1 $r.Calls
+    Assert-NotContains 'source update keeps default backup' '--no-backup' $r.Calls
+
+    $s = New-Sandbox 'source_update_no_backup'
+    Add-SourceInstall $s
+    $r = Invoke-Sandbox $s @('update', '-NoBackup') -AppxMode 'none'
+    Assert-MatchCount 'explicit no-backup reaches the one native updater' '(?m)^hermes update --yes --no-backup\r?$' 1 $r.Calls
+
+    $s = New-Sandbox 'source_already_current'
+    Add-SourceInstall $s
+    $r = Invoke-Sandbox $s @('update') -AppxMode 'none' -UpdateCurrent '1'
+    Assert-NotContains 'already-current source runs no updater' 'hermes update --yes' $r.Calls
+    Assert-NotContains 'already-current source never selects a channel' '--set-channel' $r.Calls
+
+    # 20. Exact source release, correlated receipt, and final-verdict regressions.
+    $s = New-Sandbox 'source_update_exact'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s
+    Assert-Equal 'exact source update exit' '0' "$($r.ExitCode)"
+    Assert-Contains 'exact source update verdict' 'STATUS: UPDATED' $r.Output
+    Assert-MatchCount 'exact source update runs one native updater' '(?m)^hermes update --yes\r?$' 1 $r.Calls
+    Assert-Contains 'exact target version reported' 'v0.23.3' $r.Report
+    Assert-Contains 'exact target full revision reported' '2222222222222222222222222222222222222222' $r.Report
+    Assert-Contains 'Desktop build independently verified' 'Desktop build' $r.Report
+    Assert-Contains 'Desktop build verified state' 'verified' $r.Report
+    Assert-Contains 'backend health separately verified' 'Backend health' $r.Report
+    Assert-Contains 'authentication only advertised' 'AUTH=ADVERTISED (session not tested)' $r.Output
+    Assert-Contains 'WebSocket remains untested' 'WS=NOT_TESTED' $r.Output
+    $receipt = Get-CurrentReceipt $s
+    Assert-Contains 'current receipt has operation correlation' 'hermes-ops-win-' "$($receipt.correlation_id)"
+
+    $s = New-Sandbox 'source_update_remote_target'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -LocalTargetMissing 1
+    Assert-Equal 'remote tag resolves missing local target exit' '0' "$($r.ExitCode)"
+    Assert-Contains 'remote tag resolves missing local target verdict' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'remote tag resolution uses full commit' '2222222222222222222222222222222222222222' $r.Report
+
+    $s = New-Sandbox 'source_update_http_unhealthy'
+    Add-SourceInstall $s
+    Set-Content -LiteralPath (Join-Path $s.State 'http_overall.txt') -Value 'degraded' -Encoding ASCII
+    $r = Invoke-SourceUpdateScenario $s
+    Assert-NotContains 'HTTP 200 with unhealthy payload is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'HTTP reachability itself passed' 'HTTP=PASS' $r.Output
+    Assert-Contains 'backend health failure is recorded' 'overall=degraded' $r.Report
+
+    $s = New-Sandbox 'source_update_unchanged'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode no_install
+    Assert-NotContains 'unchanged source is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'unchanged source is non-success' 'STATUS: PARTIAL' $r.Output
+    Assert-MatchCount 'unchanged source still runs updater once' '(?m)^hermes update --yes\r?$' 1 $r.Calls
+    Assert-NotContains 'unchanged source does not repair Desktop' 'hermes desktop --build-only --force-build' $r.Calls
+
+    $s = New-Sandbox 'source_update_wrong_revision'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode wrong_revision
+    Assert-NotContains 'advanced wrong revision is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'wrong revision is reported' '3333333333333333333333333333333333333333' $r.Report
+
+    $s = New-Sandbox 'source_update_wrong_version'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode wrong_version
+    Assert-NotContains 'correct revision wrong version is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'wrong reported version is reported' 'does not equal selected stable release' $r.Report
+
+    $s = New-Sandbox 'source_update_unresolved_target'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -TargetUnresolved 1
+    Assert-Equal 'unresolved target blocks before mutation' '2' "$($r.ExitCode)"
+    Assert-Contains 'unresolved target verdict' 'STATUS: BLOCKED' $r.Output
+    Assert-NotContains 'unresolved target runs no updater' 'hermes update --yes' $r.Calls
+
+    $s = New-Sandbox 'source_update_target_drift'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode target_drift
+    Assert-NotContains 'target drift is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'target drift is reported' 'target changed during execution' $r.Report
+
+    $s = New-Sandbox 'source_update_identity_change'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode identity_change
+    Assert-NotContains 'installation identity change is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'installation identity change is reported' 'installation identity changed' $r.Report
+
+    $s = New-Sandbox 'source_update_checkout_change'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode checkout_change
+    Assert-NotContains 'checkout change is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'checkout change is reported' 'checkout changed' $r.Report
+
+    $s = New-Sandbox 'source_update_dirty_after'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode dirty_after
+    Assert-NotContains 'post-update dirty checkout is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'post-update dirty checkout is reported' 'dirty after update' $r.Report
+
+    $s = New-Sandbox 'source_update_unrelated_latest'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_unrelated_latest
+    Assert-Equal 'correlated receipt survives unrelated latest exit' '0' "$($r.ExitCode)"
+    Assert-Contains 'correlated receipt survives unrelated latest verdict' 'STATUS: UPDATED' $r.Output
+
+    $s = New-Sandbox 'source_update_receipt_missing'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_missing
+    Assert-NotContains 'missing current receipt is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'missing current receipt is reported' 'correlation' $r.Report
+
+    $s = New-Sandbox 'source_update_receipt_no_correlation'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_no_correlation
+    Assert-NotContains 'receipt without correlation is not UPDATED' 'STATUS: UPDATED' $r.Output
+
+    $s = New-Sandbox 'source_update_receipt_mismatch'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_mismatch
+    Assert-NotContains 'receipt correlation mismatch is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'receipt correlation mismatch is reported' 'correlation' $r.Report
+
+    $s = New-Sandbox 'source_update_receipt_failed'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_failed_unrelated_success
+    Assert-NotContains 'failed correlated receipt is not replaced by unrelated success' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'failed correlated receipt is reported' 'outcome=failed' $r.Report
+
+    $s = New-Sandbox 'source_update_receipt_malformed'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_malformed
+    Assert-NotContains 'malformed receipt is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'malformed receipt is reported' 'unreadable' $r.Report
+
+    $s = New-Sandbox 'source_update_receipt_incomplete'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_incomplete
+    Assert-NotContains 'incomplete receipt is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'incomplete receipt is reported' 'finished_at' $r.Report
+
+    $s = New-Sandbox 'source_update_receipt_historical'
+    Add-SourceInstall $s
+    New-HistoricalReceipt $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_historical
+    Assert-NotContains 'historical receipt is not current update evidence' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'historical receipt is reported as uncorrelated' 'correlation' $r.Report
+    Assert-NotContains 'historical receipt does not authorize Desktop repair' 'hermes desktop --build-only --force-build' $r.Calls
+
+    $s = New-Sandbox 'source_update_receipt_plugin'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_plugin
+    Assert-NotContains 'plugin-check artifact is not update evidence' 'STATUS: UPDATED' $r.Output
+
+    $s = New-Sandbox 'source_update_receipt_followup'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_followup
+    Assert-NotContains 'unresolved receipt follow-up is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'unresolved receipt follow-up is PARTIAL' 'STATUS: PARTIAL' $r.Output
+
+    $s = New-Sandbox 'source_update_gateway_incomplete'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode receipt_gateway_incomplete
+    Assert-NotContains 'incomplete gateway restart is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'incomplete gateway restart is PARTIAL' 'STATUS: PARTIAL' $r.Output
+
+    $s = New-Sandbox 'source_update_correlation_scope'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -ExistingCorrelation 'pre-existing-correlation'
+    Assert-Equal 'scoped correlation update exit' '0' "$($r.ExitCode)"
+    $receipt = Get-CurrentReceipt $s
+    Assert-NotContains 'operation correlation is unique' 'pre-existing-correlation' "$($receipt.correlation_id)"
+    Assert-Equal 'prior correlation restored after updater' 'pre-existing-correlation' (Get-Content -LiteralPath (Join-Path $s.State 'observed_correlation.txt') -Raw).Trim()
+
+    $s = New-Sandbox 'source_update_failed_no_repair'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode fail -ExistingCorrelation 'prior-on-failure'
+    Assert-Contains 'failed native updater verdict' 'STATUS: FAILED' $r.Output
+    Assert-NotContains 'failed native updater does not repair Desktop' 'hermes desktop --build-only --force-build' $r.Calls
+    Assert-Equal 'prior correlation restored after failed updater' 'prior-on-failure' (Get-Content -LiteralPath (Join-Path $s.State 'observed_correlation.txt') -Raw).Trim()
+
+    $s = New-Sandbox 'source_update_failed_desktop_owed'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode fail_with_desktop_owed
+    Assert-NotContains 'failed updater Desktop-owed output does not authorize repair' 'hermes desktop --build-only --force-build' $r.Calls
+    Assert-Contains 'failed updater with Desktop-owed output stays non-success' 'STATUS: FAILED' $r.Output
+
+    $s = New-Sandbox 'source_update_desktop_repair'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode desktop_failed
+    Assert-MatchCount 'current Desktop failure authorizes one headless repair' '(?m)^hermes desktop --build-only --force-build\r?$' 1 $r.Calls
+    Assert-Contains 'native Desktop follow-up remains PARTIAL' 'STATUS: PARTIAL' $r.Output
+
+    $s = New-Sandbox 'source_update_desktop_locked'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode desktop_failed -DesktopLocked
+    Assert-NotContains 'locked Desktop is not repaired or killed' 'hermes desktop --build-only --force-build' $r.Calls
+    Assert-Contains 'locked Desktop is reported' 'holding Desktop build output' $r.Report
+
+    $s = New-Sandbox 'source_update_desktop_repair_failed'
+    Add-SourceInstall $s
+    $r = Invoke-SourceUpdateScenario $s -Mode desktop_failed -DesktopRepairFail 1
+    Assert-MatchCount 'failed Desktop repair is attempted once' '(?m)^hermes desktop --build-only --force-build\r?$' 1 $r.Calls
+    Assert-NotContains 'failed Desktop repair is not UPDATED' 'STATUS: UPDATED' $r.Output
+    Assert-Contains 'failed Desktop repair affects final status' 'Headless Desktop build repair failed' $r.Report
+
+    # 21. Source provenance failures block before any source update.
     $s = New-Sandbox 'source_provenance_ok'
     Add-SourceInstall $s
     $r = Invoke-Sandbox $s @('check') -AppxMode 'none'

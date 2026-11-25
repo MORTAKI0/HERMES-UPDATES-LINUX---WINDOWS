@@ -48,8 +48,19 @@ Optional:
 -AppInstallerFile <path>           # signed sideload descriptor, never guessed
 ```
 
+Backend URL precedence is: explicit `-BackendUrl`, then a pre-existing
+`HERMES_DESKTOP_REMOTE_URL`, then no URL (`UNKNOWN`). An explicitly supplied
+invalid URI, non-HTTP(S) URL, embedded userinfo, query or fragment is rejected;
+it is never replaced by the environment fallback. The report records which
+source was used and never prints credential userinfo.
+
 If local execution policy blocks scripts, report the blocker. Do not silently
 change machine execution policy.
+
+Native Hermes output is decoded as UTF-8 for each invocation, with the prior
+console output encoding restored afterward. Reports are written as UTF-8 so
+arrows, bullets and other valid Unicode are preserved in Windows PowerShell 5.1
+and PowerShell 7.
 
 ## Owner detection (mandatory, read-only)
 
@@ -74,7 +85,7 @@ It then selects exactly one owner:
 
 | Detection | Owner | Allowed update |
 |---|---|---|
-| Only a verified source checkout/CLI | Source build | `hermes update --set-channel stable --yes` |
+| Only a verified source checkout/CLI | Source build | `hermes update --yes` |
 | Only a Store-signed MSIX | Microsoft Store | `winget upgrade --id 9PMXK8CZC7KR --exact --source msstore ...` |
 | Only a signed sideload MSIX with a verified descriptor | Sideload MSIX | `Add-AppxPackage -AppInstallerFile <verified descriptor>` |
 | Source + MSIX both present | Unknown | `BLOCKED` |
@@ -106,10 +117,14 @@ No package mutation, process kill, GUI launch, or saved-URL edit occurs.
 
 - **Source:** preflight (`hermes update --plan`, resolved CLI install directory
   matching the discovered checkout, official NousResearch Git remote, clean
-  tree, stable channel, no downgrade), one
-  `hermes update --set-channel stable --yes`, independent version/receipt
-  checks, and a headless `hermes desktop --build-only --force-build` **only** if
-  output or receipt proves a missing/failed Desktop build.
+  tree, stable channel, no downgrade), exact installed and stable-target
+  identities (native install id plus full Git SHA, resolved locally or from the
+  verified official origin's release tag), one
+  `hermes update --yes`, independent exact version/revision/identity/receipt
+  checks, and a headless `hermes desktop --build-only --force-build` **only**
+  when the current operation's receipt/output proves a build is owed, the
+  native update completed successfully, and no Desktop process is holding the
+  build output.
 - **Store:** exact product ID `9PMXK8CZC7KR` with `--source msstore`, then
   re-reads `Get-AppxPackage`. `NO_APPLICABLE_UPGRADE` is its own outcome.
   Locked packages are reported with process evidence, never killed.
@@ -124,6 +139,22 @@ No package mutation, process kill, GUI launch, or saved-URL edit occurs.
   applicable. Missing, ambiguous, invalid, or non-advancing packages are never
   reported as success. It also re-checks source receipts, DNS/TCP/HTTP, and
   marks WebSocket `NOT_TESTED` unless truly exercised.
+
+For source updates, the wrapper generates one operation correlation id and
+scopes it to the updater through `HERMES_UPDATE_CORRELATION_ID`, restoring any
+previous value afterward. Only the terminal `update_*.json` receipt whose
+`correlation_id` matches that operation is evidence for the update. A newer
+unrelated `latest.json`, a plugin-check artifact, a historical receipt, a
+malformed/incomplete schema, a failed outcome, unresolved `followups[]`, or
+`gateway_restart.incomplete=true` cannot produce `UPDATED`. Receipts are read
+only and never rewritten or deleted.
+
+`UPDATED` also requires the CLI version and full Git HEAD to equal the
+pre-update stable target, the install id and canonical checkout to be unchanged,
+official provenance and stable channel to remain valid, the checkout to remain
+clean, the Desktop artifact to be stamped at that exact commit, and the remote
+backend JSON health check to pass. HTTP 200 alone still does not prove
+authentication or WebSocket.
 
 ## Arguments and exit codes
 
