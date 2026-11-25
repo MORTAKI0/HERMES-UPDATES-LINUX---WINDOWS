@@ -80,6 +80,7 @@ EOF
 → Selected release available: stable v0.23.3 (caafe5389ae5)
   Run `hermes update` to install it.
 EOF
+  printf '→ Update channel: stable\n→ Selected release available: stable v0.23.3 (%s)\n  Run hermes update to install it.\n' "$(cat "$SBX/target-sha")" >"$SBX/fixtures/update_check.txt"
   cat >"$SBX/fixtures/update_current.txt" <<'EOF'
 → Update channel: stable
 → Already up to date: stable v0.23.3
@@ -160,6 +161,7 @@ case "${1:-}" in
         if grep -q 'v0.23.3' "$fixtures/version.txt"; then cat "$fixtures/update_current.txt"; else cat "$fixtures/update_check.txt"; fi ;;
       --plan)
         rev=$(git -C "$FAKE_CHECKOUT" rev-parse --short=8 HEAD)
+        if [ -f "$fixtures/stale_gateway_plan" ] && grep -q 'v0.23.3' "$fixtures/version.txt"; then rev=$(git -C "$FAKE_CHECKOUT" rev-parse --short=8 HEAD~1); fi
         {
           echo "Update plan:"
           printf '  Install: git (v%s @ %s)\n' "$(current_version)" "$rev"
@@ -177,7 +179,12 @@ case "${1:-}" in
           git -C "$FAKE_CHECKOUT" checkout -q --detach "$(cat "$FAKE_SBX/target-sha")"
         fi
         cp "$fixtures/version_after.txt" "$fixtures/version.txt"
-        sed -i 's/"version":"0.23.2"/"version":"0.23.3"/' "$fixtures/http_body.json"
+        if [ ! -f "$fixtures/stale_backend_after" ]; then
+          sed -i 's/"version":"0.23.2"/"version":"0.23.3"/' "$fixtures/http_body.json"
+        fi
+        if [ -f "$fixtures/profile_disappear_after" ]; then
+          grep -v 'alpha' "$fixtures/profile_list.txt" >"$fixtures/profile_list.tmp" && mv "$fixtures/profile_list.tmp" "$fixtures/profile_list.txt"
+        fi
         if [ ! -f "$fixtures/no_upstream_gateway_restart" ]; then
           echo $(( $(cat "$FAKE_SBX/pids/gateway") + 100 )) >"$FAKE_SBX/pids/gateway"
         fi
@@ -190,11 +197,13 @@ case "${1:-}" in
         if [ -f "$fixtures/receipt_missing_after" ]; then
           echo "simulated missing receipt"; exit 0
         fi
+        cid="${HERMES_UPDATE_CORRELATION_ID:-}"
+        if [ -f "$fixtures/receipt_bad_correlation" ]; then cid="wrong-correlation"; fi
         if [ -f "$fixtures/receipt_followup_after" ]; then
           write_followup="$fixtures/../home/.hermes/logs/update_receipts/update_$(date +%s%N).json"
-          printf '{"correlation_id":"%s","outcome":"success","followups":[{"step":"gateway_restart","reason":"deferred backend restart"}],"gateway_restart":{"incomplete":true}}\n' "${HERMES_UPDATE_CORRELATION_ID:-}" >"$write_followup"
+          printf '{"correlation_id":"%s","outcome":"success","followups":[{"step":"gateway_restart","reason":"deferred backend restart"}],"gateway_restart":{"incomplete":true}}\n' "$cid" >"$write_followup"
         else
-          printf '{"correlation_id":"%s","outcome":"success","followups":[],"gateway_restart":{"incomplete":false},"desktop":{"status":"ok"}}\n' "${HERMES_UPDATE_CORRELATION_ID:-}" >"$FAKE_SBX/home/.hermes/logs/update_receipts/update_$(date +%s%N).json"
+          printf '{"correlation_id":"%s","outcome":"success","followups":[],"gateway_restart":{"incomplete":false},"desktop":{"status":"ok"}}\n' "$cid" >"$FAKE_SBX/home/.hermes/logs/update_receipts/update_$(date +%s%N).json"
         fi
         echo "simulated successful update" ;;
       *) echo "unsupported update args: $*" >&2; exit 9 ;;
@@ -408,8 +417,11 @@ MOCK
 
 run_script() {
   local dir="$1"; shift
+  local ready_budget="90"
+  [ -f "$dir/fixtures/short_ready_budget" ] && ready_budget="1"
   env PATH="$dir/bin:/usr/bin:/bin" HOME="$dir/home" \
       HERMES_HOME="$dir/home/.hermes" HERMES_OPS_REPORT_DIR="$dir/reports" \
+      HERMES_OPS_READY_BUDGET="$ready_budget" \
       FAKE_SBX="$dir" FAKE_CHECKOUT="$dir/checkout" \
       bash "$SCRIPT" "$@" >"$dir/stdout.txt" 2>"$dir/stderr.txt"
   echo $? >"$dir/status.txt"
@@ -565,12 +577,93 @@ test_update_success() {
 }
 
 
+test_update_wrong_revision_fails() {
+  new_sandbox update_wrong_revision
+  : >"$SBX/fixtures/wrong_revision"
+  run_script "$SBX" update
+  assert_eq "wrong revision exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "wrong revision not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  assert_eq "wrong revision one update" "1" "$(count_matches 'update --yes' "$SBX/calls.log")"
+  assert_eq "wrong revision no restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
+}
+
+test_update_stale_backend_fails() {
+  new_sandbox update_stale_backend
+  : >"$SBX/fixtures/stale_backend_after"
+  : >"$SBX/fixtures/short_ready_budget"
+  run_script "$SBX" update
+  assert_eq "stale backend exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "stale backend not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "stale backend reported" "backend version could not be verified" "$report"
+}
+
+test_update_profile_disappear_fails() {
+  new_sandbox update_profile_disappear
+  : >"$SBX/fixtures/profile_disappear_after"
+  run_script "$SBX" update
+  assert_eq "profile disappear exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "profile disappear not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "profile disappear reported" "registered profile disappeared" "$report"
+}
+
+test_update_receipt_correlation_mismatch_fails() {
+  new_sandbox update_receipt_mismatch
+  : >"$SBX/fixtures/receipt_bad_correlation"
+  run_script "$SBX" update
+  assert_eq "receipt mismatch exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "receipt mismatch not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "receipt mismatch reported" "correlation_id" "$report"
+}
+
+test_update_gateway_stale_revision_fails() {
+  new_sandbox update_gateway_stale
+  : >"$SBX/fixtures/stale_gateway_plan"
+  run_script "$SBX" update
+  assert_eq "gateway stale revision exit" "1" "$(status_of "$SBX")"
+  assert_not_contains "gateway stale revision not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
+  local report
+  report=$(report_of "$SBX")
+  assert_contains "gateway stale revision reported" "live gateway revision" "$report"
+}
+
+test_update_blocked_in_hermes_cgroup() {
+  new_sandbox update_unsafe_context
+  local fake="$SBX/fakeproc"
+  mkdir -p "$fake"
+  env PATH="$SBX/bin:/usr/bin:/bin" HOME="$SBX/home" \
+      HERMES_HOME="$SBX/home/.hermes" HERMES_OPS_REPORT_DIR="$SBX/reports" \
+      FAKE_SBX="$SBX" FAKE_CHECKOUT="$SBX/checkout" FAKE_PROC="$fake" \
+      SCRIPT_PATH="$SCRIPT" \
+      bash -c '
+        pid=$$
+        mkdir -p "$FAKE_PROC/$pid"
+        printf "Name:\tbash\nPPid:\t%s\n" "$PPID" >"$FAKE_PROC/$pid/status"
+        printf "0::/system.slice/hermes-gateway.service\n" >"$FAKE_PROC/$pid/cgroup"
+        exec env HERMES_OPS_PROC_ROOT="$FAKE_PROC" PATH="$PATH" HOME="$HOME" \
+          HERMES_HOME="$HERMES_HOME" HERMES_OPS_REPORT_DIR="$HERMES_OPS_REPORT_DIR" \
+          FAKE_SBX="$FAKE_SBX" FAKE_CHECKOUT="$FAKE_CHECKOUT" \
+          bash "$SCRIPT_PATH" update
+      ' >"$SBX/stdout.txt" 2>"$SBX/stderr.txt"
+  echo $? >"$SBX/status.txt"
+  assert_eq "unsafe context exit" "2" "$(status_of "$SBX")"
+  assert_contains "unsafe context blocked" "STATUS: BLOCKED" "$SBX/stdout.txt"
+  assert_contains "unsafe context reason" "cgroup" "$SBX/stdout.txt"
+  assert_eq "unsafe context no update" "0" "$(count_matches 'update --yes' "$SBX/calls.log")"
+  assert_eq "unsafe context no restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
+}
+
 test_update_post_update_conflict_prevents_restarts() {
   new_sandbox update_post_conflict
   : >"$SBX/fixtures/post_update_conflict"
   run_script "$SBX" update
-  assert_eq "post-update conflict exit" "2" "$(status_of "$SBX")"
-  assert_contains "post-update conflict blocked" "STATUS: BLOCKED" "$SBX/stdout.txt"
+  assert_eq "post-update conflict exit" "1" "$(status_of "$SBX")"
+  assert_contains "post-update conflict partial" "STATUS: PARTIAL" "$SBX/stdout.txt"
   assert_not_contains "post-update conflict not updated" "STATUS: UPDATED" "$SBX/stdout.txt"
   assert_eq "post-update conflict no gateway restart" "0" "$(count_matches 'gateway restart' "$SBX/calls.log")"
   assert_eq "post-update conflict no backend restart" "0" "$(count_matches 'restart hermes-serve.service' "$SBX/calls.log")"
@@ -773,6 +866,12 @@ test_update_blocked_dirty
 test_update_blocked_migration
 test_update_blocked_sudo
 test_update_success
+test_update_wrong_revision_fails
+test_update_stale_backend_fails
+test_update_profile_disappear_fails
+test_update_receipt_correlation_mismatch_fails
+test_update_gateway_stale_revision_fails
+test_update_blocked_in_hermes_cgroup
 test_update_post_update_conflict_prevents_restarts
 test_update_respects_upstream_restart
 test_update_partial_receipt

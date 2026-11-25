@@ -80,6 +80,7 @@ STABLE_TARGET_SHA_BEFORE="unknown"
 UPDATE_AVAILABLE="unknown"
 UPDATE_CHECK_STATUS="not run"
 UPDATE_PLAN_STATUS="not run"
+UPDATE_PLAN_OUTPUT=""
 PLAN_INSTALL_LINE="unknown"
 PLAN_PROFILES=""
 RUNNING_SERVICE_LINES=""
@@ -125,7 +126,6 @@ BACKEND_READY="unknown"
 LINGER="unknown"
 EXPECTED_PROFILES=""
 EXPECTED_PROFILE_COUNT="unknown"
-PROFILE_DIRS=""
 REGISTERED_PROFILES=""
 PARKED_PROFILES=""
 STANDALONE_PROFILES=""
@@ -158,6 +158,7 @@ RECEIPT_GATEWAY_INCOMPLETE="unknown"
 RECEIPT_DESKTOP="unknown"
 RECEIPT_CHECK="NOT_TESTED"
 RECEIPT_CORRELATION=""
+RECEIPT_KIND=""
 DOCTOR_STATUS="not run"
 DOCTOR_WARNINGS=""
 PM_STATUS="not run"
@@ -449,7 +450,7 @@ discover_git() {
     *) GIT_BRANCH="unknown"; integrity_ok="no"; add_degraded PRECHECK "checkout branch could not be read (git exit $RUN_STATUS)" ;;
   esac
 
-  capture 30 git -C "$CHECKOUT" rev-parse --short=12 HEAD
+  capture 30 git -C "$CHECKOUT" rev-parse HEAD
   if [ "$RUN_STATUS" -eq 0 ] && [ -n "$RUN_OUTPUT" ]; then
     GIT_HEAD=$(printf '%s\n' "$RUN_OUTPUT" | head -n 1)
   else
@@ -585,6 +586,7 @@ discover_update_plan() {
   [ -n "$HERMES_BIN" ] || return 0
   capture 90 "$HERMES_BIN" update --plan
   UPDATE_PLAN_STATUS="exit $RUN_STATUS"
+  UPDATE_PLAN_OUTPUT="$RUN_OUTPUT"
   if [ "$RUN_STATUS" -ne 0 ]; then
     add_degraded PRECHECK "hermes update --plan failed (exit $RUN_STATUS)"
     record_check_row "Update plan" "readable" "exit $RUN_STATUS" "FAIL"
@@ -874,10 +876,6 @@ recompute_profile_counts() {
 
 discover_profiles() {
   [ -n "$HERMES_BIN" ] || return 0
-  PROFILE_DIRS=""
-  if [ -d "$HERMES_HOME_DIR/profiles" ]; then
-    PROFILE_DIRS=$(find "$HERMES_HOME_DIR/profiles" -mindepth 1 -maxdepth 1 -type d -printf '%f\n' 2>/dev/null | sort | tr '\n' ',' | sed 's/,$//')
-  fi
 
   capture 90 "$HERMES_BIN" profile list
   PROFILE_LIST_STATUS="exit $RUN_STATUS"
@@ -887,6 +885,8 @@ discover_profiles() {
       /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
         name=$1; sub(/^[◆*]+/, "", name);
         if (name == "Profile") next;
+        if (NF < 3) next;
+        if (name ~ /:$/) next;
         if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
         if (tolower($0) ~ /deleted/) next;
         print name
@@ -895,6 +895,8 @@ discover_profiles() {
       /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
         name=$1; sub(/^[◆*]+/, "", name);
         if (name == "Profile") next;
+        if (NF < 3) next;
+        if (name ~ /:$/) next;
         if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
         if (tolower($0) ~ /deleted/) next;
         if (tolower($0) ~ /parked/) next;
@@ -905,6 +907,8 @@ discover_profiles() {
       /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
         name=$1; sub(/^[◆*]+/, "", name);
         if (name == "Profile") next;
+        if (NF < 3) next;
+        if (name ~ /:$/) next;
         if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
         if (tolower($0) ~ /deleted/) next;
         if (tolower($0) ~ /parked/) print name
@@ -913,6 +917,8 @@ discover_profiles() {
       /^[[:space:]]*[◆*]?[A-Za-z0-9_.-]+[[:space:]]/ {
         name=$1; sub(/^[◆*]+/, "", name);
         if (name == "Profile") next;
+        if (NF < 3) next;
+        if (name ~ /:$/) next;
         if ($0 ~ /Model|Gateway|Alias|Distribution|─/) next;
         if (tolower($0) ~ /deleted/) next;
         if (tolower($0) ~ /standalone/) print name
@@ -937,8 +943,6 @@ discover_profiles() {
       EXPECTED_PROFILES="$PLAN_PROFILES"
     elif [ -n "$registered" ]; then
       EXPECTED_PROFILES="$registered"
-    elif [ -n "$PROFILE_DIRS" ]; then
-      EXPECTED_PROFILES="default,$PROFILE_DIRS"
     fi
   fi
   if [ -n "$registered" ] && [ -n "$EXPECTED_PROFILES" ]; then
@@ -1197,6 +1201,17 @@ PY
 }
 
 # Native update receipt -----------------------------------------------------
+receipt_correlation_id() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1], "r", encoding="utf-8", errors="replace") as fh:
+        print(str(json.load(fh).get("correlation_id") or ""))
+except Exception:
+    print("")
+PY
+}
+
 discover_receipt() {
   local receipt_dir="$HERMES_HOME_DIR/logs/update_receipts"
   if [ ! -d "$receipt_dir" ]; then
@@ -1208,6 +1223,17 @@ discover_receipt() {
   fi
   local newest="" latest="$receipt_dir/latest.json" latest_kind=""
   newest=$(find "$receipt_dir" -maxdepth 1 -type f -name 'update_*.json' -printf '%T@ %p\n' 2>/dev/null | sort -nr | head -n 1 | cut -d' ' -f2-)
+  if [ -n "$UPDATE_CORRELATION_ID" ]; then
+    local f cid
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      cid=$(receipt_correlation_id "$f")
+      if [ "$cid" = "$UPDATE_CORRELATION_ID" ]; then
+        newest="$f"
+        break
+      fi
+    done < <(find "$receipt_dir" -maxdepth 1 -type f -name 'update_*.json' 2>/dev/null)
+  fi
   if [ -f "$latest" ]; then
     latest_kind=$(python3 - "$latest" <<'PY' 2>/dev/null
 import json, sys
@@ -1253,7 +1279,7 @@ desktop = data.get("desktop")
 desktop_text = ""
 if isinstance(desktop, dict):
     desktop_text = str(desktop.get("status") or desktop.get("result") or "")
-print("%s\t%d\t%s\t%s\t%s\t%s" % (str(data.get("outcome") or "unknown"), len(followups), text, incomplete, desktop_text or "unknown", str(data.get("correlation_id") or "")))
+print("%s\t%d\t%s\t%s\t%s\t%s\t%s" % (str(data.get("outcome") or "unknown"), len(followups), text, incomplete, desktop_text or "unknown", str(data.get("correlation_id") or ""), str(data.get("kind") or "")))
 PY
 )
   RECEIPT_OUTCOME=$(printf '%s' "$parsed" | cut -f1)
@@ -1262,6 +1288,7 @@ PY
   RECEIPT_GATEWAY_INCOMPLETE=$(printf '%s' "$parsed" | cut -f4)
   RECEIPT_DESKTOP=$(printf '%s' "$parsed" | cut -f5)
   RECEIPT_CORRELATION=$(printf '%s' "$parsed" | cut -f6)
+  RECEIPT_KIND=$(printf '%s' "$parsed" | cut -f7)
   local receipt_mtime
   receipt_mtime=$(stat -c %Y "$newest" 2>/dev/null || echo 0)
   if [ "${receipt_mtime:-0}" -ge "$OPERATION_STARTED_EPOCH" ]; then RECEIPT_FRESH="yes"; else RECEIPT_FRESH="no"; fi
@@ -1269,6 +1296,9 @@ PY
   if [ "$RECEIPT_OUTCOME" = unreadable ]; then
     RECEIPT_CHECK="FAIL"
     add_degraded RECEIPT "newest update receipt is unreadable: $newest"
+  elif [ -n "$RECEIPT_KIND" ] && [ "$RECEIPT_KIND" = plugin-check ]; then
+    RECEIPT_CHECK="FAIL"
+    add_degraded RECEIPT "selected receipt is a plugin-check artifact, not an update receipt: $newest"
   elif [ "$RECEIPT_FOLLOWUP_COUNT" != 0 ] || [ "$RECEIPT_GATEWAY_INCOMPLETE" = True ] || [ "$RECEIPT_GATEWAY_INCOMPLETE" = true ]; then
     RECEIPT_CHECK="FAIL"
     add_degraded RECEIPT "native update receipt has ${RECEIPT_FOLLOWUP_COUNT:-0} unresolved follow-up(s)${RECEIPT_FOLLOWUP_TEXT:+: $RECEIPT_FOLLOWUP_TEXT}"
@@ -1354,19 +1384,35 @@ exec_signature() {
 }
 
 check_update_execution_context() {
-  local ancestor=$$ cgroup args parent
+  local proc_root="${HERMES_OPS_PROC_ROOT:-/proc}"
+  local ancestor=$$ cgroup parent
   while [ "$ancestor" -gt 1 ] 2>/dev/null; do
-    [ -r "/proc/$ancestor/status" ] && [ -r "/proc/$ancestor/cgroup" ] || {
+    [ -r "$proc_root/$ancestor/status" ] && [ -r "$proc_root/$ancestor/cgroup" ] || {
       add_blocked PRECHECK "process ancestry cannot be verified; run the update from an independent terminal"
       return 1
     }
-    cgroup=$(cat "/proc/$ancestor/cgroup" 2>/dev/null)
-    args=$(tr '\0' ' ' <"/proc/$ancestor/cmdline" 2>/dev/null)
-    if printf '%s\n%s\n' "$cgroup" "$args" | grep -qiE 'hermes[^ /]*(gateway|serve)|hermes[-_](gateway|serve)\.service'; then
-      add_blocked PRECHECK "update was launched from a Hermes-managed service or agent context; use an independent SSH or terminal session"
+    cgroup=$(cat "$proc_root/$ancestor/cgroup" 2>/dev/null)
+    [ -n "$cgroup" ] || {
+      add_blocked PRECHECK "process cgroup evidence is unavailable; run the update from an independent terminal"
+      return 1
+    }
+    if [ -n "$GATEWAY_PID" ] && [ "$GATEWAY_PID" != unknown ] && [ "$ancestor" = "$GATEWAY_PID" ]; then
+      add_blocked PRECHECK "update was launched from the Hermes gateway process; use an independent SSH or terminal session"
       return 1
     fi
-    parent=$(awk '/^PPid:/ {print $2}' "/proc/$ancestor/status" 2>/dev/null)
+    if [ -n "$SERVE_PID" ] && [ "$SERVE_PID" != unknown ] && [ "$ancestor" = "$SERVE_PID" ]; then
+      add_blocked PRECHECK "update was launched from the Hermes backend process; use an independent SSH or terminal session"
+      return 1
+    fi
+    if [ -n "$GATEWAY_UNIT" ] && printf '%s' "$cgroup" | grep -Fq "$GATEWAY_UNIT"; then
+      add_blocked PRECHECK "update was launched inside the gateway service cgroup; use an independent SSH or terminal session"
+      return 1
+    fi
+    if [ -n "$SERVE_UNIT" ] && printf '%s' "$cgroup" | grep -Fq "$SERVE_UNIT"; then
+      add_blocked PRECHECK "update was launched inside the backend service cgroup; use an independent SSH or terminal session"
+      return 1
+    fi
+    parent=$(awk '/^PPid:/ {print $2}' "$proc_root/$ancestor/status" 2>/dev/null)
     [ -n "$parent" ] && [ "$parent" != "$ancestor" ] || {
       add_blocked PRECHECK "process ancestry cannot be verified; run the update from an independent terminal"
       return 1
@@ -1412,6 +1458,9 @@ update_preflight() {
   if [ "$HTTP_AUTH_REQUIRED" = unknown ] && [ "$SERVE_ACTIVE" = active ]; then
     add_warning "Backend /api/status was not validated before update; post-update comparison will be partial"
   fi
+  if [ -z "$REGISTERED_PROFILES" ]; then
+    add_blocked PRECHECK "authoritative registered profile inventory could not be established"
+  fi
   n=$(count_lines "$BLOCKED_FILE")
   if [ "$n" -gt 0 ]; then
     return 1
@@ -1420,14 +1469,23 @@ update_preflight() {
   return 0
 }
 
+monotonic_now() {
+  local file="${HERMES_OPS_UPTIME_FILE:-/proc/uptime}"
+  awk '{print int($1)}' "$file" 2>/dev/null | head -n 1
+}
+
 poll_backend_ready() {
-  local start now remaining sleep_s
-  start=$(date +%s)
+  local start now remaining sleep_s budget="${HERMES_OPS_READY_BUDGET:-90}"
+  start=$(monotonic_now)
+  [ -n "$start" ] || { add_degraded SERVE_BACKEND "monotonic clock unavailable for readiness polling"; return 1; }
   BACKEND_READY="no"
   while :; do
-    now=$(date +%s)
-    remaining=$((90 - (now - start)))
+    now=$(monotonic_now)
+    [ -n "$now" ] || break
+    remaining=$((budget - (now - start)))
     [ "$remaining" -le 0 ] && break
+    SERVE_ACTIVE=$(unit_show "$SERVE_SCOPE" "$SERVE_UNIT" ActiveState)
+    SERVE_PID=$(unit_show "$SERVE_SCOPE" "$SERVE_UNIT" MainPID)
     PROBE_TIMEOUT=$remaining
     [ "$PROBE_TIMEOUT" -gt 8 ] && PROBE_TIMEOUT=8
     [ "$PROBE_TIMEOUT" -lt 1 ] && PROBE_TIMEOUT=1
@@ -1435,19 +1493,20 @@ poll_backend_ready() {
     discover_backend_url
     probe_backend
     PROBE_QUIET=no
-    if [ "$HTTP_CHECK" = PASS ] && { [ -z "$HTTP_VERSION" ] || [ "$HTTP_VERSION" = unknown ] || [ "$HTTP_VERSION" = "$HERMES_VERSION" ]; } && [ "$HTTP_OVERALL" != invalid ]; then
+    if [ "$HTTP_CHECK" = PASS ] && [ "$HTTP_VERSION" = "$HERMES_VERSION" ] && [ "$HTTP_OVERALL" = ok ] && backend_listener_owned; then
       BACKEND_READY="yes"
       return 0
     fi
-    now=$(date +%s)
-    remaining=$((90 - (now - start)))
+    now=$(monotonic_now)
+    [ -n "$now" ] || break
+    remaining=$((budget - (now - start)))
     [ "$remaining" -le 1 ] && break
     sleep_s=2
     [ "$sleep_s" -gt "$remaining" ] && sleep_s=$remaining
     [ "$sleep_s" -gt 0 ] && sleep "$sleep_s"
   done
   BACKEND_READY="no"
-  add_degraded SERVE_BACKEND "backend did not become ready within the 90-second readiness budget"
+  add_degraded SERVE_BACKEND "backend did not become ready within the ${budget}-second readiness budget"
   return 1
 }
 
@@ -1477,6 +1536,18 @@ perform_update() {
   return 0
 }
 
+gateway_live_revision_matches() {
+  local installed live_rev
+  installed=$(git -C "$CHECKOUT" rev-parse HEAD 2>/dev/null || true)
+  live_rev=$(printf '%s\n' "$UPDATE_PLAN_OUTPUT" | awk '
+    /gateway/ && /@/ { for (i=1;i<=NF;i++) if ($i=="@") { print $(i+1); exit } }')
+  [ -n "$installed" ] && [ -n "$live_rev" ] || return 1
+  case "$installed" in
+    "$live_rev"*) return 0 ;;
+  esac
+  return 1
+}
+
 verify_gateway_runtime() {
   [ -n "$GATEWAY_UNIT" ] || { add_degraded GATEWAY "gateway unit missing after update"; return; }
   if [ "$GATEWAY_UNIT" != "$PRE_GATEWAY_UNIT" ] || [ "$GATEWAY_SCOPE" != "$PRE_GATEWAY_SCOPE" ] || [ "$GATEWAY_USER" != "$PRE_GATEWAY_USER" ]; then
@@ -1494,6 +1565,20 @@ verify_gateway_runtime() {
   if ! printf '%s' "$GATEWAY_EXEC" | grep -Fq "$CHECKOUT"; then
     add_degraded GATEWAY "gateway checkout binding changed after update"
   fi
+  if ! gateway_live_revision_matches; then
+    add_degraded GATEWAY "live gateway revision could not be verified against the installed release"
+  fi
+}
+
+backend_listener_owned() {
+  [ -n "$BACKEND_URL" ] && [ -n "$SERVE_PID" ] || return 1
+  local port line
+  port=$(printf '%s' "$BACKEND_URL" | sed -n 's#.*:\([0-9][0-9]*\).*#\1#p')
+  [ -n "$port" ] || return 1
+  command -v ss >/dev/null 2>&1 || return 1
+  line=$(ss -ltnp 2>/dev/null | grep -F ":$port " | head -n 1 || true)
+  [ -n "$line" ] || return 1
+  printf '%s' "$line" | grep -Fq "pid=$SERVE_PID,"
 }
 
 verify_backend_runtime() {
@@ -1513,11 +1598,14 @@ verify_backend_runtime() {
   if [ -n "$BACKEND_URL" ] && [ "$HTTP_CHECK" != PASS ]; then
     add_degraded SERVE_BACKEND "backend HTTP health failed after update ($HTTP_CHECK)"
   fi
-  if [ -n "$HTTP_VERSION" ] && [ "$HTTP_VERSION" != unknown ] && [ "$HTTP_VERSION" != "$HERMES_VERSION" ]; then
-    add_degraded SERVE_BACKEND "backend reports version $HTTP_VERSION, expected $HERMES_VERSION"
+  if [ -z "$HTTP_VERSION" ] || [ "$HTTP_VERSION" = unknown ] || [ "$HTTP_VERSION" != "$HERMES_VERSION" ]; then
+    add_degraded SERVE_BACKEND "backend version could not be verified as $HERMES_VERSION (reported=${HTTP_VERSION:-unknown})"
   fi
-  if [ -n "$HTTP_OVERALL" ] && [ "$HTTP_OVERALL" != unknown ] && [ "$HTTP_OVERALL" != ok ]; then
-    add_degraded SERVE_BACKEND "backend reports overall status $HTTP_OVERALL"
+  if [ -z "$HTTP_OVERALL" ] || [ "$HTTP_OVERALL" != ok ]; then
+    add_degraded SERVE_BACKEND "backend overall status is not ok (${HTTP_OVERALL:-unknown})"
+  fi
+  if [ -n "$BACKEND_URL" ] && ! backend_listener_owned; then
+    add_degraded SERVE_BACKEND "backend listener ownership could not be verified for $BACKEND_URL"
   fi
 }
 
@@ -1532,6 +1620,12 @@ verify_profile_inventory() {
       add_degraded GATEWAY "registered profile disappeared after update: $p"
     fi
   done
+  for p in $(printf '%s' "$REGISTERED_PROFILES" | tr ',' ' '); do
+    [ -n "$p" ] || continue
+    if ! printf '%s\n' "$REGISTERED_PROFILES_BEFORE" | tr ',' '\n' | grep -Fxq "$p"; then
+      add_degraded GATEWAY "unexpected profile registration after update: $p"
+    fi
+  done
   if [ "$PARKED_PROFILES" != "$PARKED_PROFILES_BEFORE" ]; then
     add_degraded GATEWAY "parked profile state changed after update"
   fi
@@ -1544,10 +1638,11 @@ verify_profile_inventory() {
 }
 
 decide_update() {
-  local blocks problems unverified
+  local blocks problems unverified degraded
   blocks=$(count_lines "$BLOCKED_FILE")
   problems=0
   unverified=$(count_lines "$UNVERIFIED_FILE")
+  degraded=$(count_lines "$DEGRADED_FILE")
   if [ "$UPDATE_EXIT" != "not run" ] && [ "$UPDATE_EXIT" -ne 0 ]; then
     problems=$((problems + 1))
     add_degraded SOURCE_UPDATE "official updater exited $UPDATE_EXIT; not retried"
@@ -1563,6 +1658,12 @@ decide_update() {
     if [ "$GIT_HEAD_BEFORE" != unknown ] && { [ "$GIT_HEAD" = unknown ] || [ "$GIT_HEAD" = "$GIT_HEAD_BEFORE" ]; }; then
       problems=$((problems + 1))
       add_degraded SOURCE_UPDATE "Git revision did not advance from $GIT_HEAD_BEFORE (after=${GIT_HEAD:-unknown})"
+    fi
+    if [ "$STABLE_TARGET_SHA_BEFORE" != unknown ] && [ "$GIT_HEAD" != unknown ]; then
+      case "$GIT_HEAD" in
+        "$STABLE_TARGET_SHA_BEFORE"*) ;;
+        *) problems=$((problems + 1)); add_degraded SOURCE_UPDATE "installed Git revision $GIT_HEAD does not match selected stable revision $STABLE_TARGET_SHA_BEFORE" ;;
+      esac
     fi
     if [ -n "$UPDATE_CORRELATION_ID" ] && [ "$RECEIPT_CORRELATION" != "$UPDATE_CORRELATION_ID" ]; then
       problems=$((problems + 1))
@@ -1593,7 +1694,7 @@ decide_update() {
       add_degraded SOURCE_UPDATE "checkout is dirty after update"
     fi
   fi
-  if [ "$unverified" -gt 0 ]; then
+  if [ "$degraded" -gt 0 ] || [ "$unverified" -gt 0 ]; then
     problems=$((problems + 1))
   fi
   if [ "$GATEWAY_ACTIVE" != active ]; then
@@ -1628,8 +1729,18 @@ decide_update() {
   fi
 
   if [ "$blocks" -gt 0 ]; then
-    STATUS="BLOCKED" ; EXIT_CODE=2
-    SUMMARY=$(head -n 1 "$BLOCKED_FILE" | cut -d'|' -f2-)
+    if [ "$UPDATE_EXIT" != "not run" ]; then
+      if [ "$UPDATE_EXIT" -ne 0 ]; then
+        STATUS="FAILED" ; EXIT_CODE=1
+        SUMMARY="Official updater exited $UPDATE_EXIT; post-update verification also recorded: $(head -n 1 "$BLOCKED_FILE" | cut -d'|' -f2-)"
+      else
+        STATUS="PARTIAL" ; EXIT_CODE=1
+        SUMMARY="Update ran, but post-update verification found: $(head -n 1 "$BLOCKED_FILE" | cut -d'|' -f2-)"
+      fi
+    else
+      STATUS="BLOCKED" ; EXIT_CODE=2
+      SUMMARY=$(head -n 1 "$BLOCKED_FILE" | cut -d'|' -f2-)
+    fi
   elif [ "$UPDATE_EXIT" != "not run" ] && [ "$UPDATE_EXIT" -ne 0 ]; then
     STATUS="FAILED" ; EXIT_CODE=1
     SUMMARY="Official updater exited $UPDATE_EXIT; no retry was attempted."
